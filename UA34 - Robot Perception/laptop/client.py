@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-SERVER_IP   = "192.168.1.119"
+SERVER_IP   = "172.31.62.173"
 SERVER_PORT = 2222
 BUF         = 65535
 TIMEOUT     = 3.0
@@ -240,7 +240,7 @@ class PerceptionClient:
             print(
                 f"[SAVED] Timestamp : {sample.timestamp}\n"
                 f"        Image     : Datos/{img_path.name} [{sample.image_size_field}]\n"
-                f"        Sensors   : LDR={sample.ldr} | Temp={sample.temp} C | US1={sample.us1} cm | US2={sample.us2} cm\n"
+                f"        Sensors   : LDR={sample.ldr}% | Temp={sample.temp} C | US1={sample.us1} cm | US2={sample.us2} cm\n"
                 f"        CSV       : Datos/{csv_path.name}"
             )
             return True

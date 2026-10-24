@@ -4,12 +4,13 @@
   Classes:
     - MedianFIFO<T, N>  : Static circular buffer + Insertion Sort median filter
     - UltrasonicSensor  : HC-SR04 hardware driver with MedianFIFO
-    - AnalogSensor      : Generic ADC sensor driver (LDR & LM35) with MedianFIFO
+    - AnalogSensor      : Generic ADC sensor driver (LDR mapped 0-100%) with MedianFIFO
+    - KY013Sensor       : NTC Thermistor module driver (Steinhart-Hart °C) with MedianFIFO
     - RoverSensorNode   : Main controller managing non-blocking interleaved sampling
                           and zero-heap-allocation UART command parsing
   Pins:
-    - LDR (Light level)         : Analog A0
-    - LM35 (Temperature in °C)  : Analog A1
+    - LDR (Light level %)       : Analog A0
+    - KY-013 (Temperature °C)   : Analog A1
     - HC-SR04 #1 (Ultrasonic 1) : TRIG = D2, ECHO = D3
     - HC-SR04 #2 (Ultrasonic 2) : TRIG = D4, ECHO = D5
 */
@@ -18,10 +19,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
 
 // ── Pin & Filter Constants ───────────────────────────────────────────────────
 constexpr uint8_t  PIN_LDR          = A0;
-constexpr uint8_t  PIN_LM35         = A1;
+constexpr uint8_t  PIN_KY013        = A1;
 constexpr uint8_t  PIN_TRIG1        = 2;
 constexpr uint8_t  PIN_ECHO1        = 3;
 constexpr uint8_t  PIN_TRIG2        = 4;
@@ -107,7 +109,7 @@ class UltrasonicSensor {
     }
 };
 
-// ── Class 3: Analog Sensor (LDR / LM35) ──────────────────────────────────────
+// ── Class 3: Analog Sensor (LDR mapped 0-100%) ───────────────────────────────
 class AnalogSensor {
   private:
     const uint8_t _pin;
@@ -136,11 +138,47 @@ class AnalogSensor {
     }
 };
 
-// ── Class 4: Rover Sensor Node Controller ────────────────────────────────────
+// ── Class 4: KY-013 NTC Thermistor Sensor (Steinhart-Hart Equation) ──────────
+class KY013Sensor {
+  private:
+    const uint8_t _pin;
+    MedianFIFO<float, FIFO_WINDOW> _filter;
+
+    static constexpr float R1 = 10000.0f;         // 10 kOhm series resistor on KY-013
+    static constexpr float C1 = 0.001129148f;     // Steinhart-Hart coefficient A
+    static constexpr float C2 = 0.000234125f;     // Steinhart-Hart coefficient B
+    static constexpr float C3 = 0.0000000876741f; // Steinhart-Hart coefficient C
+
+  public:
+    explicit KY013Sensor(uint8_t pin) : _pin(pin) {}
+
+    void init() {
+      pinMode(_pin, INPUT);
+    }
+
+    void sample() {
+      int raw = analogRead(_pin);
+      // Clamp to [1, 1022] to prevent division by zero or log(0) if disconnected
+      raw = constrain(raw, 1, 1022);
+
+      float r2    = R1 * (1023.0f / (float)raw - 1.0f);
+      float logR2 = log(r2);
+      float tempK = 1.0f / (C1 + (C2 * logR2) + (C3 * logR2 * logR2 * logR2));
+      float tempC = tempK - 273.15f;
+
+      _filter.push(tempC);
+    }
+
+    float getFilteredCelsius() const {
+      return _filter.median();
+    }
+};
+
+// ── Class 5: Rover Sensor Node Controller ────────────────────────────────────
 class RoverSensorNode {
   private:
     AnalogSensor     _ldr;
-    AnalogSensor     _lm35;
+    KY013Sensor      _tempSensor;
     UltrasonicSensor _us1;
     UltrasonicSensor _us2;
 
@@ -151,7 +189,7 @@ class RoverSensorNode {
 
     void _sendTelemetry() const {
       int   ldr_val  = _ldr.getFilteredInt();
-      float temp_val = _lm35.getFilteredFloat();
+      float temp_val = _tempSensor.getFilteredCelsius();
       float us1_val  = _us1.getFilteredCm();
       float us2_val  = _us2.getFilteredCm();
 
@@ -167,7 +205,6 @@ class RoverSensorNode {
     }
 
     void _handleCommand(const char* rawCmd) {
-      // Trim leading spaces
       while (*rawCmd == ' ' || *rawCmd == '\t') rawCmd++;
       if (*rawCmd == '\0') return;
 
@@ -177,7 +214,6 @@ class RoverSensorNode {
         up[i] = (char)toupper((unsigned char)rawCmd[i]);
         i++;
       }
-      // Trim trailing spaces
       while (i > 0 && (up[i - 1] == ' ' || up[i - 1] == '\t')) i--;
       up[i] = '\0';
 
@@ -190,30 +226,30 @@ class RoverSensorNode {
     }
 
   public:
-    RoverSensorNode(uint8_t pinLdr, uint8_t pinLm35,
+    RoverSensorNode(uint8_t pinLdr, uint8_t pinKy013,
                     uint8_t trig1, uint8_t echo1,
                     uint8_t trig2, uint8_t echo2)
-      : _ldr(pinLdr, 1.0f),
-        _lm35(pinLm35, 500.0f / 1023.0f),
+      : _ldr(pinLdr, 100.0f / 1023.0f), // Mapped 0-1023 ADC -> 0-100 %
+        _tempSensor(pinKy013),          // KY-013 NTC Steinhart-Hart (°C)
         _us1(trig1, echo1),
         _us2(trig2, echo2) {}
 
     void init() {
       _ldr.init();
-      _lm35.init();
+      _tempSensor.init();
       _us1.init();
       _us2.init();
 
       // Prime FIFO buffers with spaced readings to avoid ultrasonic echo overlap
       for (uint8_t i = 0; i < FIFO_WINDOW; ++i) {
         _ldr.sample();
-        _lm35.sample();
+        _tempSensor.sample();
         _us1.sample();
         delay(15);
         _us2.sample();
         delay(15);
       }
-      Serial.println("[READY] RoverSensorNode | OOP FIFO Median N=5 | LDR, LM35, 2x HC-SR04");
+      Serial.println("[READY] RoverSensorNode | OOP FIFO Median N=5 | LDR(%), KY-013(C), 2x HC-SR04");
     }
 
     void update() {
@@ -222,8 +258,7 @@ class RoverSensorNode {
       if (now - _lastPhaseMs >= PHASE_PERIOD_MS) {
         _lastPhaseMs = now;
         _ldr.sample();
-        _lm35.sample();
-        // Alternate US1 and US2 every 25ms to eliminate acoustic interference
+        _tempSensor.sample();
         if (!_toggleUs) {
           _us1.sample();
         } else {
@@ -249,7 +284,7 @@ class RoverSensorNode {
 };
 
 // ── Global Node Object ───────────────────────────────────────────────────────
-RoverSensorNode sensorNode(PIN_LDR, PIN_LM35, PIN_TRIG1, PIN_ECHO1, PIN_TRIG2, PIN_ECHO2);
+RoverSensorNode sensorNode(PIN_LDR, PIN_KY013, PIN_TRIG1, PIN_ECHO1, PIN_TRIG2, PIN_ECHO2);
 
 void setup() {
   Serial.begin(9600);

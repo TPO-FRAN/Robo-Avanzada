@@ -3,10 +3,10 @@
 raspberry/server.py — Object-Oriented UDP↔UART Data Reception & Transmission Server.
 
 Classes:
-  - SensorReading          : Value object holding filtered LDR, LM35, US1, and US2 data.
+  - SensorReading          : Value object holding filtered LDR, KY-013, US1, and US2 data.
   - ArduinoSerialInterface : Manages UART port discovery, connection, and [DATA] parsing.
   - UDPPerceptionServer    : Two-thread UDP server coordinating ArduinoSerialInterface
-                             and USBWebCamera (imported from camera.py).
+                             and USBWebCamera (from camera.py).
 """
 import socket
 import threading
@@ -18,7 +18,7 @@ from dataclasses import dataclass
 import serial
 import serial.tools.list_ports
 
-from camera import USBWebCamera
+from camera import USBWebCamera, CameraSnapshot
 
 UDP_IP     = "0.0.0.0"
 UDP_PORT   = 2222
@@ -47,10 +47,9 @@ class ArduinoSerialInterface:
         re.IGNORECASE,
     )
 
-    def __init__(self, preferred_port: str = SERIAL, baud: int = BAUD, mock: bool = False):
+    def __init__(self, preferred_port: str = SERIAL, baud: int = BAUD):
         self.preferred_port = preferred_port
         self.baud           = baud
-        self.mock           = mock
         self._ser           = None
         self._lock          = threading.Lock()
 
@@ -73,10 +72,6 @@ class ArduinoSerialInterface:
         return preferred_port
 
     def connect(self):
-        if self.mock:
-            print("[UART] Running in MOCK sensor mode.")
-            return
-
         active = self.find_port(self.preferred_port)
         try:
             self._ser = serial.Serial(active, self.baud, timeout=0.5)
@@ -84,8 +79,7 @@ class ArduinoSerialInterface:
             self._ser.reset_input_buffer()
             print(f"[UART] Connected to {active} @ {self.baud}")
         except serial.SerialException as e:
-            print(f"[SERIAL WARNING] Could not open {active} ({e}). Falling back to mock sensor values.")
-            self.mock = True
+            print(f"[SERIAL ERROR] Could not open {active} ({e}).")
             self._ser = None
 
     def read_sensors(self, timeout: float = 1.5) -> SensorReading:
@@ -93,8 +87,8 @@ class ArduinoSerialInterface:
         Sends 'READ\\n' to Arduino and waits specifically for a '[DATA] ...' line,
         ignoring any delayed startup banners like '[READY]'.
         """
-        if self.mock or self._ser is None:
-            return SensorReading(ldr="512", temp="24.50", us1="35.20", us2="41.80")
+        if self._ser is None:
+            return SensorReading(ldr="0", temp="0.00", us1="0.00", us2="0.00")
 
         with self._lock:
             try:
@@ -138,15 +132,15 @@ class UDPPerceptionServer:
     """
     Two-thread UDP server:
       - Thread-1 (WiFiListener)  : Receives UDP commands from Laptop Client
-      - Thread-2 (UARTCommander) : Coordinates ArduinoSerialInterface & USBWebCamera
+      - Thread-2 (UARTCommander) : Coordinates ArduinoSerialInterface & USBWebCamera (camera.py)
     """
     def __init__(self, udp_ip=UDP_IP, udp_port=UDP_PORT,
-                 serial_port=SERIAL, baud=BAUD, camera_index=0, mock=False):
+                 serial_port=SERIAL, baud=BAUD, camera_index=0):
         self._q       = queue.Queue()
         self._stop    = threading.Event()
         self._sock    = self._open_udp(udp_ip, udp_port)
-        self._arduino = ArduinoSerialInterface(serial_port, baud, mock=mock)
-        self._camera  = USBWebCamera(camera_index=camera_index, mock=mock)
+        self._arduino = ArduinoSerialInterface(serial_port, baud)
+        self._camera  = USBWebCamera(camera_index=camera_index)
 
         self._t1 = threading.Thread(target=self._wifi_listener_worker,  daemon=True, name="WiFiListener")
         self._t2 = threading.Thread(target=self._uart_commander_worker, daemon=True, name="UARTCommander")
@@ -192,7 +186,7 @@ class UDPPerceptionServer:
                     snap = self._camera.get_snapshot()
                     msg = (
                         f"[STATUS] cam={snap.resolution_str} ({snap.size_bytes} B), "
-                        f"ldr={reading.ldr}, temp={reading.temp}, us1={reading.us1}, us2={reading.us2}"
+                        f"ldr={reading.ldr}%, temp={reading.temp} C, us1={reading.us1} cm, us2={reading.us2} cm"
                     )
                     self._sock.sendto(msg.encode(), addr)
                     print(f"[TX STATUS->UDP] '{msg}' -> {addr}")
@@ -200,24 +194,30 @@ class UDPPerceptionServer:
                     err = f"[ERROR] Unknown command '{cmd}'. Use CAPTURE or STATUS."
                     self._sock.sendto(err.encode(), addr)
             except Exception as e:
+                err_msg = f"[ERROR] {e}"
                 print(f"[DISPATCH ERR] {e}")
+                try:
+                    self._sock.sendto(err_msg.encode(), addr)
+                except Exception:
+                    pass
             finally:
                 self._q.task_done()
         print(f"[{threading.current_thread().name}] Stopped.")
 
     def _handle_capture(self, addr):
         """
-        Reads Arduino sensors + grabs camera snapshot, then sends:
+        Invokes USBWebCamera.get_snapshot() from camera.py + reads Arduino sensors,
+        then transmits:
           1. META|<ldr>|<temp>|<us1>|<us2>|<width>x<height>|<size_bytes>|<num_chunks>
           2. CHUNK|<idx>|<raw_bytes> for each chunk
         """
         reading = self._arduino.read_sensors()
-        snap = self._camera.get_snapshot()
+        snap: CameraSnapshot = self._camera.get_snapshot()
 
         chunks = [
             snap.jpeg_bytes[i : i + CHUNK_SIZE]
             for i in range(0, len(snap.jpeg_bytes), CHUNK_SIZE)
-        ] or [b""]
+        ]
         num_chunks = len(chunks)
 
         meta = (
@@ -234,7 +234,7 @@ class UDPPerceptionServer:
 
         print(
             f"[TX CAPTURE->UDP] {snap.resolution_str} ({snap.size_bytes} B, {num_chunks} chunk(s)) | "
-            f"LDR={reading.ldr} Temp={reading.temp} C US1={reading.us1} cm US2={reading.us2} cm -> {addr}"
+            f"LDR={reading.ldr}% Temp={reading.temp} C US1={reading.us1} cm US2={reading.us2} cm -> {addr}"
         )
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
@@ -266,10 +266,9 @@ def main():
     p.add_argument("--serial-port", default=SERIAL)
     p.add_argument("--baudrate",    type=int, default=BAUD)
     p.add_argument("--camera",      type=int, default=0)
-    p.add_argument("--mock",        action="store_true", help="Run with simulated Arduino & camera data")
     a = p.parse_args()
 
-    server = UDPPerceptionServer(a.udp_ip, a.udp_port, a.serial_port, a.baudrate, a.camera, a.mock)
+    server = UDPPerceptionServer(a.udp_ip, a.udp_port, a.serial_port, a.baudrate, a.camera)
     server.start()
     try:
         while True:
