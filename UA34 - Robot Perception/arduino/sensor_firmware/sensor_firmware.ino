@@ -37,7 +37,7 @@ constexpr uint32_t PULSE_TIMEOUT_US = 25000UL; // ~4.2 m max range timeout
 
 // ── C Functions for FIFO & Median Filter ─────────────────
 
-// Slide 12: Apply FIFO shift (First-In, First-Out queue of size 5)
+// Apply FIFO shift (First-In, First-Out queue of size 5)
 void applyFIFO(float readings[FIFO_SIZE], float newReading) {
   for (int i = 0; i < 4; i++) {
     readings[i] = readings[i + 1];
@@ -45,7 +45,7 @@ void applyFIFO(float readings[FIFO_SIZE], float newReading) {
   readings[4] = newReading;
 }
 
-// Helper C function required by Slide 10: sortArray(readingsCopy, 5)
+// Helper C function: sortArray(readingsCopy, 5)
 void sortArray(float arr[], int size) {
   for (int i = 0; i < size - 1; i++) {
     for (int j = 0; j < size - i - 1; j++) {
@@ -58,7 +58,7 @@ void sortArray(float arr[], int size) {
   }
 }
 
-// Slide 10: 4. Median Filter — Takes the middle value of the sorted list
+// Median Filter — Takes the middle value of the sorted list
 float calculateMedian(const float readings[FIFO_SIZE]) {
   float readingsCopy[5];
   memcpy(readingsCopy, readings, sizeof(readingsCopy));
