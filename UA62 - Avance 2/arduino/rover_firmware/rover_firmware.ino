@@ -15,6 +15,13 @@
     - A <b> <e>   : 2-DOF arm target angles (0..180 deg)
     - X           : Immediate STOP (wheels detached + arm frozen)
     - ?           : Query STATUS telemetry
+
+  Calibration commands (Arduino Serial Monitor @ 115200, "Newline"; wheels in the air):
+    - L <us> / R <us> : Raw PWM on left/right wheel pair (1000..2000), e.g. L 1475
+    - C <l> <r>       : Set neutral center in RAM to test W with calibration, e.g. C 1492 1508
+    - D <0|1>         : Stop mode: 1 = detach() PWM, 0 = send neutral PWM
+    - K               : Print active calibration
+    - STOP (or S)     : Stop both wheels (same as X)
 */
 
 #include <Arduino.h>
@@ -35,6 +42,15 @@ constexpr uint16_t US_TIMEOUT_US = 15000U;
 constexpr uint16_t OBS_TRIG_MM   = 200U;  // 20.0 cm
 constexpr uint16_t OBS_CLEAR_MM  = 250U;  // 25.0 cm
 constexpr uint8_t  TURN_MAX_SPD  = 55, TURN_MIN_SPD = 28;
+
+// ── Wheel Calibration (tune with L/R/C commands in the Serial Monitor) ───────
+constexpr int16_t PWM_CENTRO_L   = 1500, PWM_CENTRO_R   = 1500; // Neutral: wheel does NOT spin
+constexpr int16_t PWM_MIN_L      = 1000, PWM_MAX_L      = 2000; // Absolute pulse limits
+constexpr int16_t PWM_MIN_R      = 1000, PWM_MAX_R      = 2000;
+constexpr int16_t PWM_ARRANQUE_L = 30,   PWM_ARRANQUE_R = 30;   // us from neutral where wheel starts spinning
+constexpr int16_t PWM_SATURA_L   = 200,  PWM_SATURA_R   = 200;  // us from neutral where wheel reaches max speed
+constexpr int8_t  ZONA_MUERTA    = 5;     // |pct| below this is treated as 0
+constexpr bool    STOP_CON_DETACH = true; // true: cut PWM on stop; false: send neutral PWM
 
 // ── PCINT2 Zero-Blocking Ultrasonic Echo Capture ─────────────────────────────
 enum EchoState : uint8_t { US_IDLE = 0, US_RISE, US_FALL, US_DONE };
@@ -182,25 +198,53 @@ public:
 
 // ── Class 3: Wheel & Arm Actuators (Zero-Creep Detach + Smooth Arm Ramp) ─────
 class Actuators {
-  Servo   _wL, _wR, _aB, _aE;
-  bool    _attL = false, _attR = false;
+  // One calibrated wheel channel (each pin drives a parallel pair of MG996R)
+  struct Wheel {
+    Servo   s;
+    uint8_t pin; bool inv, att;
+    int16_t center, minUs, maxUs, startOff, satOff, lastUs;
+    Wheel(uint8_t p, bool i, int16_t c, int16_t mn, int16_t mx, int16_t so, int16_t sa)
+      : pin(p), inv(i), att(false), center(c), minUs(mn), maxUs(mx), startOff(so), satOff(sa), lastUs(0) {}
+  };
+  Wheel   _L{ PIN_WHEEL_L, INV_LEFT,  PWM_CENTRO_L, PWM_MIN_L, PWM_MAX_L, PWM_ARRANQUE_L, PWM_SATURA_L };
+  Wheel   _R{ PIN_WHEEL_R, INV_RIGHT, PWM_CENTRO_R, PWM_MIN_R, PWM_MAX_R, PWM_ARRANQUE_R, PWM_SATURA_R };
+  Servo   _aB, _aE;
+  bool    _stopDetach = STOP_CON_DETACH;
   int8_t  _lPct = 0, _rPct = 0;
   uint8_t _curB = ARM_B_HOME, _curE = ARM_E_HOME, _tgtB = ARM_B_HOME, _tgtE = ARM_E_HOME;
   uint32_t _armMs = 0;
 
-  static void _setWheel(Servo &s, bool &att, uint8_t pin, int8_t pct, bool inv) {
-    if (pct == 0) {
-      if (att) { s.detach(); digitalWrite(pin, LOW); att = false; }
-    } else {
-      if (!att) { s.attach(pin); att = true; }
-      int16_t p = inv ? -pct : pct;
-      s.writeMicroseconds(1500 + p * 5);
-    }
+  // pct -> us: ZONA_MUERTA% = ARRANQUE offset, 100% = SATURA offset (integer, monotonic)
+  static int16_t _pctToUs(const Wheel &w, int8_t pct) {
+    int16_t a = pct < 0 ? -pct : pct;
+    int16_t off = w.startOff + (int16_t)(((int32_t)(w.satOff - w.startOff) * (a - ZONA_MUERTA))
+                                         / (100 - ZONA_MUERTA));
+    if ((pct < 0) != w.inv) off = -off;
+    return constrain((int16_t)(w.center + off), w.minUs, w.maxUs);
+  }
+
+  // Physical output: pulse stored BEFORE attach (first pulse is always correct), written only on change
+  static void _out(Wheel &w, int16_t us) {
+    if (us != w.lastUs || !w.att) { w.s.writeMicroseconds(us); w.lastUs = us; }
+    if (!w.att) { w.s.attach(w.pin, w.minUs, w.maxUs); w.att = true; }
+  }
+
+  void _stopWheel(Wheel &w) {
+    if (_stopDetach) {
+      if (w.att) { w.s.detach(); digitalWrite(w.pin, LOW); w.att = false; }
+    } else _out(w, w.center);
+  }
+
+  void _setWheel(Wheel &w, int8_t pct) {
+    if (pct > -ZONA_MUERTA && pct < ZONA_MUERTA) _stopWheel(w);
+    else _out(w, _pctToUs(w, pct));
   }
 
 public:
   void init() {
     pinMode(PIN_WHEEL_L, OUTPUT); pinMode(PIN_WHEEL_R, OUTPUT);
+    digitalWrite(PIN_WHEEL_L, LOW); digitalWrite(PIN_WHEEL_R, LOW);
+    if (!_stopDetach) { _out(_L, _L.center); _out(_R, _R.center); }
     _aB.attach(PIN_ARM_B); _aE.attach(PIN_ARM_E);
     _aB.write(_curB); _aE.write(_curE);
   }
@@ -208,9 +252,21 @@ public:
   void setWheels(int16_t l, int16_t r) {
     _lPct = (int8_t)constrain(l, -100, 100);
     _rPct = (int8_t)constrain(r, -100, 100);
-    _setWheel(_wL, _attL, PIN_WHEEL_L, _lPct, INV_LEFT);
-    _setWheel(_wR, _attR, PIN_WHEEL_R, _rPct, INV_RIGHT);
+    _setWheel(_L, _lPct);
+    _setWheel(_R, _rPct);
   }
+
+  // ── Calibration helpers (Serial Monitor) ──
+  void rawUs(bool left, int16_t us) {
+    Wheel &w = left ? _L : _R;
+    _out(w, constrain(us, w.minUs, w.maxUs));
+    if (left) _lPct = 0; else _rPct = 0;
+  }
+  void setCenters(int16_t cl, int16_t cr) { _L.center = cl; _R.center = cr; }
+  void setStopDetach(bool d) { _stopDetach = d; }
+  int16_t centerL() const { return _L.center; }
+  int16_t centerR() const { return _R.center; }
+  bool stopDetach() const { return _stopDetach; }
 
   void setArm(int16_t b, int16_t e) {
     _tgtB = (uint8_t)constrain(b, 0, 180);
@@ -234,7 +290,7 @@ public:
 };
 
 // ── Global Hardware Instances & Compact State Machine ────────────────────────
-enum Mode : uint8_t { M_IDLE = 0, M_DRIVE, M_GYRO, M_REV };
+enum Mode : uint8_t { M_IDLE = 0, M_DRIVE, M_GYRO, M_REV, M_CAL };
 static UltrasonicSensor us1(PIN_TRIG1, PIN_ECHO1, &g_ec1), us2(PIN_TRIG2, PIN_ECHO2, &g_ec2);
 static ImuSensor        imu;
 static Actuators        act;
@@ -325,6 +381,46 @@ static void handleOpcode(const char* cmd) {
         mode = M_GYRO;
         Serial.print(F("[ACK] G|")); Serial.print(turnRight ? 'R' : 'L'); Serial.print('|'); Serial.println(tgtTurnDdeg);
       } else Serial.println(F("[ERROR] G <ddeg>"));
+      break;
+    }
+    // ── Calibration commands (Serial Monitor only; never sent by control.py) ──
+    case 'L': case 'R': {
+      char* endP; long us = strtol(arg, &endP, 10);
+      while (*endP == ' ') endP++;
+      if (endP != arg && *endP == '\0' && us >= 1000 && us <= 2000) {
+        act.rawUs(op == 'L', (int16_t)us); mode = M_CAL;
+        Serial.print(F("[ACK] ")); Serial.print(op); Serial.print('|'); Serial.println(us);
+      } else Serial.println(F("[ERROR] L|R <1000-2000>"));
+      break;
+    }
+    case 'C': {
+      int16_t cl, cr;
+      if (parseTwoInts(arg, cl, cr) && cl >= 1300 && cl <= 1700 && cr >= 1300 && cr <= 1700) {
+        act.setCenters(cl, cr);
+        Serial.print(F("[ACK] C|")); Serial.print(cl); Serial.print('|'); Serial.println(cr);
+      } else Serial.println(F("[ERROR] C <l> <r>"));
+      break;
+    }
+    case 'D': {
+      while (*arg == ' ') arg++;
+      if ((arg[0] == '0' || arg[0] == '1') && arg[1] == '\0') {
+        act.setStopDetach(arg[0] == '1');
+        Serial.print(F("[ACK] D|")); Serial.println(arg[0]);
+      } else Serial.println(F("[ERROR] D <0|1>"));
+      break;
+    }
+    case 'K': {
+      Serial.print(F("[CAL] cL=")); Serial.print(act.centerL());
+      Serial.print(F(",cR="));      Serial.print(act.centerR());
+      Serial.print(F(",det="));     Serial.println(act.stopDetach() ? 1 : 0);
+      break;
+    }
+    case 'S': { // "S" or "STOP" typed in the Serial Monitor
+      while (*arg == ' ') arg++;
+      if (*arg == '\0' || strcasecmp_P(arg, PSTR("TOP")) == 0) {
+        act.stopAll(); mode = M_IDLE;
+        Serial.println(F("[ACK] X"));
+      } else Serial.println(F("[ERROR] OP"));
       break;
     }
     default:
