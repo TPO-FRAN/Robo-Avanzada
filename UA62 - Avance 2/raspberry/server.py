@@ -3,12 +3,14 @@
 raspberry/server.py — Object-Oriented Two-Thread UDP Server for Rover Control (UA62 - Avance 2).
 
 Architecture modeled after UA34 - Robot Perception:
-  - Thread-1 (WiFiListener)      : Receives UDP commands from Laptop Client.
+  - Thread-1 (WiFiListener)      : Receives UDP commands from Laptop Client with emergency
+                                   STOP queue preemption.
   - Thread-2 (CommandDispatcher) : Dispatches commands to RoverController (control.py)
                                    and returns natural-language Spanish responses via UDP.
   - Async Event Push             : Immediately forwards asynchronous IMU & Ultrasonic
                                    events from RoverController to the connected Laptop client.
 """
+import os
 import queue
 import socket
 import threading
@@ -18,6 +20,15 @@ from control import RoverController, SERIAL_PORT, BAUD_RATE
 UDP_IP   = "0.0.0.0"
 UDP_PORT = 2222
 BUF_SIZE = 2048
+
+
+def _disable_windows_udp_connreset(sock: socket.socket):
+    """Prevents Windows Winsock ICMP Port-Unreachable (WinError 10054) from dropping UDP reads."""
+    if os.name == "nt" and hasattr(socket, "SIO_UDP_CONNRESET"):
+        try:
+            sock.ioctl(socket.SIO_UDP_CONNRESET, False)
+        except OSError:
+            pass
 
 
 class UDPRoverServer:
@@ -37,6 +48,7 @@ class UDPRoverServer:
         self._q: queue.Queue[tuple[str, tuple[str, int]]] = queue.Queue()
         self._stop = threading.Event()
         self._addr_lock = threading.Lock()
+        self._tx_lock   = threading.Lock()
         self._last_client_addr: tuple[str, int] | None = None
 
         self._sock = self._open_udp(udp_ip, udp_port)
@@ -56,10 +68,24 @@ class UDPRoverServer:
     def _open_udp(self, ip: str, port: int) -> socket.socket:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        _disable_windows_udp_connreset(s)
         s.bind((ip, port))
         s.settimeout(0.5)
         print(f"[UDP ] Servidor enlazado en {ip}:{port}")
         return s
+
+    def _flush_pending_commands(self):
+        """Flushes unexecuted commands when an emergency STOP arrives."""
+        flushed = 0
+        while not self._q.empty():
+            try:
+                self._q.get_nowait()
+                self._q.task_done()
+                flushed += 1
+            except queue.Empty:
+                break
+        if flushed > 0:
+            print(f"[UDP PRIORITY] STOP descartó {flushed} comando(s) pendiente(s) en cola.")
 
     # ── Thread Workers ───────────────────────────────────────────────────────
     def _wifi_listener_worker(self):
@@ -72,6 +98,8 @@ class UDPRoverServer:
                     with self._addr_lock:
                         self._last_client_addr = addr
                     print(f"[UDP RX] '{cmd}' desde {addr[0]}:{addr[1]}")
+                    if self.controller.is_emergency_stop(cmd):
+                        self._flush_pending_commands()
                     self._q.put((cmd, addr))
             except (socket.timeout, ConnectionResetError):
                 continue
@@ -92,7 +120,7 @@ class UDPRoverServer:
                 if cmd.upper() == "PING":
                     reply = "Conectado al Rover (Raspberry Pi 5 lista)"
                 else:
-                    reply = self.controller.execute_command(cmd)
+                    reply = self.controller.execute_command(cmd, defer_events=True)
 
                 self._send_udp(reply, addr)
                 print(f"[TX->UDP] '{reply}' -> {addr[0]}:{addr[1]}")
@@ -101,6 +129,8 @@ class UDPRoverServer:
                 print(f"[DISPATCH ERR] {e}")
                 self._send_udp(err_msg, addr)
             finally:
+                # Guarantee chronological delivery of any [EVENT] that followed [ACK]
+                self.controller.flush_deferred_events()
                 self._q.task_done()
         print(f"[{threading.current_thread().name}] Detenido.")
 
@@ -113,11 +143,12 @@ class UDPRoverServer:
             print(f"[EVENT->UDP] '{message}' -> {target[0]}:{target[1]}")
 
     def _send_udp(self, text: str, addr: tuple[str, int]):
-        try:
-            self._sock.sendto(text.encode("utf-8"), addr)
-        except OSError as e:
-            if not self._stop.is_set():
-                print(f"[UDP TX ERR] {e}")
+        with self._tx_lock:
+            try:
+                self._sock.sendto(text.encode("utf-8"), addr)
+            except OSError as e:
+                if not self._stop.is_set():
+                    print(f"[UDP TX ERR] {e}")
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
     def start(self):

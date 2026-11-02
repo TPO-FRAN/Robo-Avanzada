@@ -6,9 +6,8 @@ Architecture:
                                     UDP server (MOVE-FORWARD 50, TURN-RIGHT 20, TURN-RIGHT 80 20,
                                     ARM-EXTEND, ARM-HOME, STOP, STATUS, etc.).
   - Terminal 2 (Response Monitor) : Automatically opened by client.py in a separate console window
-                                    (--monitor mode) to display real-time Raspberry Pi responses:
-                                    "Avancé a 50% de velocidad", "Giré 20 grados a la derecha",
-                                    "Extendí el brazo", "Me detuve", etc.
+                                    (--monitor mode) using an OS-assigned conflict-free ephemeral
+                                    localhost UDP port and deterministic __MONITOR_READY__ handshake.
 """
 import argparse
 import os
@@ -21,26 +20,40 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-SERVER_IP    = "172.31.62.173"
+SERVER_IP    = "172.20.20.3"
 SERVER_PORT  = 2222
-MONITOR_PORT = 2223
+MONITOR_PORT = 0  # 0 = conflict-free OS-assigned ephemeral UDP port
 BUF_SIZE     = 2048
+
+
+def _disable_windows_udp_connreset(sock: socket.socket):
+    """Prevents Windows Winsock ICMP Port-Unreachable (WinError 10054) from dropping UDP reads."""
+    if os.name == "nt" and hasattr(socket, "SIO_UDP_CONNRESET"):
+        try:
+            sock.ioctl(socket.SIO_UDP_CONNRESET, False)
+        except OSError:
+            pass
 
 
 class MonitorTerminalLauncher:
     """
     Launches a second terminal window running `client.py --monitor` so that
     Raspberry Pi responses and asynchronous sensor/IMU events are displayed
-    in a dedicated terminal window.
+    in a dedicated terminal window without port collisions.
     """
     @staticmethod
-    def launch(monitor_port: int = MONITOR_PORT) -> subprocess.Popen | None:
+    def launch(monitor_port: int = 0, ack_port: int = 0) -> subprocess.Popen | None:
         script_path = str(Path(__file__).resolve())
-        cmd = [sys.executable, script_path, "--monitor", "--monitor-port", str(monitor_port)]
+        cmd = [
+            sys.executable,
+            script_path,
+            "--monitor",
+            "--monitor-port", str(monitor_port),
+            "--ack-port",     str(ack_port),
+        ]
 
         try:
             if os.name == "nt":
-                # Opens a separate console window on Windows
                 return subprocess.Popen(
                     cmd,
                     creationflags=subprocess.CREATE_NEW_CONSOLE,
@@ -51,7 +64,6 @@ class MonitorTerminalLauncher:
                 osa = f'tell application "Terminal" to do script "{escaped}"'
                 return subprocess.Popen(["osascript", "-e", osa])
 
-            # Linux desktop terminals
             for term in ("gnome-terminal", "konsole", "xfce4-terminal", "x-terminal-emulator", "xterm"):
                 if shutil.which(term):
                     if term == "gnome-terminal":
@@ -66,13 +78,16 @@ class MonitorTerminalLauncher:
 class ResponseMonitorTerminal:
     """
     Runs inside the second terminal window opened by MonitorTerminalLauncher.
-    Displays every response and asynchronous event from the Raspberry Pi 5.
+    Binds an exclusive localhost UDP port (no SO_REUSEADDR port hijacking on Windows),
+    reports its actual bound port back to Terminal 1 via `__MONITOR_READY__|<port>`,
+    and displays every response and asynchronous event from the Raspberry Pi 5.
     """
-    def __init__(self, port: int = MONITOR_PORT):
-        self.port = port
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(("127.0.0.1", self.port))
+    def __init__(self, port: int = 0, ack_port: int = 0):
+        self.ack_port = ack_port
+        self._sock    = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        _disable_windows_udp_connreset(self._sock)
+        self._sock.bind(("127.0.0.1", port))
+        self.port = self._sock.getsockname()[1]
         self._sock.settimeout(0.5)
 
     def run(self):
@@ -80,11 +95,20 @@ class ResponseMonitorTerminal:
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         if os.name == "nt":
             os.system("chcp 65001 >nul & title Terminal de Respuestas del Rover (Raspberry Pi 5)")
+
+        # Send deterministic handshake with actual bound port back to Terminal 1
+        if self.ack_port > 0:
+            handshake = f"__MONITOR_READY__|{self.port}".encode("utf-8")
+            try:
+                self._sock.sendto(handshake, ("127.0.0.1", self.ack_port))
+            except OSError:
+                pass
+
         print("=" * 72)
         print("  TERMINAL DE RESPUESTAS DEL ROVER — RASPBERRY PI 5 (UA62 - Avance 2)")
-        print(f"  Escuchando respuestas y eventos en tiempo real (127.0.0.1:{self.port})")
+        print(f"  Canal local IPC activo en 127.0.0.1:{self.port}")
         print("=" * 72)
-        print("  Esperando acciones del Rover...\n")
+        print("  Esperando respuestas y eventos del Rover...\n")
 
         try:
             while True:
@@ -95,12 +119,12 @@ class ResponseMonitorTerminal:
                         continue
                     if msg == "__CLOSE_MONITOR__":
                         print("\n[INFO] Cliente de comandos cerrado. Saliendo de la terminal de respuestas...")
-                        time.sleep(1.0)
+                        time.sleep(0.8)
                         break
 
                     ts = datetime.now().strftime("%H:%M:%S")
                     print(f"  [{ts}] ➔  {msg}")
-                except socket.timeout:
+                except (socket.timeout, ConnectionResetError):
                     continue
         except KeyboardInterrupt:
             print("\n[INFO] Monitor finalizado.")
@@ -111,9 +135,9 @@ class ResponseMonitorTerminal:
 class RoverControlClient:
     """
     Object-oriented UDP client for the Laptop Command Terminal.
-    Sends user commands to the Raspberry Pi 5 UDP server and routes all incoming
-    responses and asynchronous events (IMU turn completion, ultrasonic obstacle
-    evasion) to the second terminal window.
+    Uses two isolated sockets:
+      - `self._net_sock` : Communicates exclusively with Raspberry Pi 5 over WiFi/UDP.
+      - `self._ipc_sock` : Forwards incoming messages exclusively to Terminal 2 on 127.0.0.1.
     """
     def __init__(
         self,
@@ -122,14 +146,25 @@ class RoverControlClient:
         monitor_port: int = MONITOR_PORT,
         spawn_monitor: bool = True,
     ):
-        self._server_addr  = (server_ip, server_port)
-        self._monitor_addr = ("127.0.0.1", monitor_port)
-        self._spawn_monitor = spawn_monitor
+        resolved_ip = self._resolve_host(server_ip)
+        self._server_addr   = (resolved_ip, server_port)
+        self._monitor_addr: tuple[str, int] | None = (
+            ("127.0.0.1", monitor_port) if monitor_port > 0 else None
+        )
+        self._req_monitor_port = monitor_port
+        self._spawn_monitor    = spawn_monitor
 
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.settimeout(0.3)
+        self._net_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        _disable_windows_udp_connreset(self._net_sock)
+        self._net_sock.settimeout(0.3)
+
+        self._ipc_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        _disable_windows_udp_connreset(self._ipc_sock)
+        self._ipc_sock.bind(("127.0.0.1", 0))
+        self._ipc_sock.settimeout(0.2)
 
         self._stop = threading.Event()
+        self._got_first_reply = threading.Event()
         self._monitor_proc: subprocess.Popen | None = None
         self._rx_thread = threading.Thread(
             target=self._udp_receiver_worker,
@@ -137,37 +172,86 @@ class RoverControlClient:
             name="UDPResponseForwarder",
         )
 
+    @staticmethod
+    def _resolve_host(host: str) -> str:
+        try:
+            return socket.gethostbyname(host)
+        except socket.gaierror:
+            print(f"[WARN] No se pudo resolver '{host}'; se intentará usar literalmente.")
+            return host
+
+    def _is_monitor_alive(self) -> bool:
+        return (
+            self._monitor_proc is not None
+            and self._monitor_proc.poll() is None
+            and self._monitor_addr is not None
+        )
+
+    def _wait_for_monitor_ready(self, timeout: float = 3.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._monitor_proc is None or self._monitor_proc.poll() is not None:
+                return
+            try:
+                data, _ = self._ipc_sock.recvfrom(256)
+                text = data.decode("utf-8", errors="replace").strip()
+                if text.startswith("__MONITOR_READY__|"):
+                    bound_port = int(text.split("|", 1)[1])
+                    self._monitor_addr = ("127.0.0.1", bound_port)
+                    return
+            except (socket.timeout, ConnectionResetError, ValueError):
+                continue
+
+    def _deliver_to_monitor(self, msg: str):
+        if self._is_monitor_alive() and self._monitor_addr is not None:
+            try:
+                self._ipc_sock.sendto(msg.encode("utf-8"), self._monitor_addr)
+                return
+            except OSError:
+                pass
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"\n  [{ts} RPi] ➔  {msg}")
+
     def start(self):
         if self._spawn_monitor:
-            self._monitor_proc = MonitorTerminalLauncher.launch(self._monitor_addr[1])
-            time.sleep(0.4)
+            ack_port = self._ipc_sock.getsockname()[1]
+            self._monitor_proc = MonitorTerminalLauncher.launch(
+                monitor_port=self._req_monitor_port,
+                ack_port=ack_port,
+            )
+            if self._monitor_proc is not None and self._monitor_proc.poll() is None:
+                self._wait_for_monitor_ready(timeout=3.0)
 
         self._rx_thread.start()
-        # Register client address with Raspberry Pi server
+
+        # Register client address with Raspberry Pi server and check initial reachability
         try:
-            self._sock.sendto(b"PING", self._server_addr)
-        except OSError:
-            pass
+            self._net_sock.sendto(b"PING", self._server_addr)
+            if not self._got_first_reply.wait(timeout=0.9):
+                self._deliver_to_monitor(
+                    f"[AVISO] Sin respuesta inicial de {self._server_addr[0]}:{self._server_addr[1]} "
+                    f"(verifica IP o que main.py esté corriendo en la Raspberry Pi)"
+                )
+        except OSError as e:
+            self._deliver_to_monitor(f"[AVISO RED] No se pudo enviar PING inicial: {e}")
 
     def _udp_receiver_worker(self):
         """
         Continuously receives UDP datagrams from the Raspberry Pi 5 (both synchronous
         command replies and asynchronous IMU/Ultrasonic events) and forwards them to
-        the Response Monitor Terminal.
+        the Response Monitor Terminal (with automatic inline fallback if Terminal 2 was closed).
         """
         while not self._stop.is_set():
             try:
-                data, _ = self._sock.recvfrom(BUF_SIZE)
+                data, addr = self._net_sock.recvfrom(BUF_SIZE)
+                if addr[1] != self._server_addr[1]:
+                    continue
                 msg = data.decode("utf-8", errors="replace").strip()
                 if not msg:
                     continue
 
-                if self._monitor_proc is not None:
-                    self._sock.sendto(msg.encode("utf-8"), self._monitor_addr)
-                else:
-                    # Fallback inline print if --no-monitor-window was used
-                    ts = datetime.now().strftime("%H:%M:%S")
-                    print(f"\n[{ts} RPi] ➔ {msg}")
+                self._got_first_reply.set()
+                self._deliver_to_monitor(msg)
             except (socket.timeout, ConnectionResetError):
                 continue
             except OSError:
@@ -178,8 +262,11 @@ class RoverControlClient:
         clean = cmd.strip()
         if not clean:
             return
+        if len(clean) > 63:
+            print("  [ERR] El comando excede el límite de 63 caracteres del buffer UART.")
+            return
         try:
-            self._sock.sendto(clean.encode("utf-8"), self._server_addr)
+            self._net_sock.sendto(clean.encode("utf-8"), self._server_addr)
             print(f"  [TX -> RPi] {clean}")
         except OSError as e:
             print(f"  [ERR UDP] No se pudo enviar el comando: {e}")
@@ -188,15 +275,16 @@ class RoverControlClient:
         self._stop.set()
         if self._rx_thread.is_alive():
             self._rx_thread.join(timeout=0.8)
-        if self._monitor_proc is not None:
+        if self._is_monitor_alive() and self._monitor_addr is not None:
             try:
-                self._sock.sendto(b"__CLOSE_MONITOR__", self._monitor_addr)
+                self._ipc_sock.sendto(b"__CLOSE_MONITOR__", self._monitor_addr)
             except OSError:
                 pass
-        try:
-            self._sock.close()
-        except Exception:
-            pass
+        for s in (self._net_sock, self._ipc_sock):
+            try:
+                s.close()
+            except Exception:
+                pass
 
     @staticmethod
     def _print_help():
@@ -213,8 +301,8 @@ class RoverControlClient:
         print("    STOP                          Detiene todas las ruedas y servos")
         print("-" * 74)
         print("  Comandos del Brazo Robótico (2 GDL - 2x MG996R Estándar):")
-        print("    ARM-EXTEND  (o ARM-DEPLOYMENT) Extiende el brazo robótico")
-        print("    ARM-RETRIEVE (o ARM-HOME)      Regresa el brazo a posición home")
+        print("    ARM-EXTEND  (o ARM-DEPLOYMENT) Extiende suavemente el brazo robótico")
+        print("    ARM-RETRIEVE (o ARM-HOME)      Regresa suavemente el brazo a posición home")
         print("    ARM <base 0-180> <codo 0-180>  Ej: ARM 90 120")
         print("-" * 74)
         print("  Sensores y Sistema:")
@@ -266,12 +354,13 @@ def main():
     parser.add_argument("--ip",           default=SERVER_IP,   help=f"IP de la Raspberry Pi 5 (default: {SERVER_IP})")
     parser.add_argument("--port",         type=int, default=SERVER_PORT,  help=f"Puerto UDP servidor (default: {SERVER_PORT})")
     parser.add_argument("--monitor",      action="store_true", help="Ejecuta esta instancia como la Terminal 2 (Monitor de Respuestas)")
-    parser.add_argument("--monitor-port", type=int, default=MONITOR_PORT, help=f"Puerto local del monitor (default: {MONITOR_PORT})")
+    parser.add_argument("--monitor-port", type=int, default=MONITOR_PORT, help="Puerto local del monitor (0 = automático libre)")
+    parser.add_argument("--ack-port",     type=int, default=0,            help=argparse.SUPPRESS)
     parser.add_argument("--no-spawn",     action="store_true", help="No abrir automáticamente la segunda ventana de terminal")
     args = parser.parse_args()
 
     if args.monitor:
-        monitor = ResponseMonitorTerminal(port=args.monitor_port)
+        monitor = ResponseMonitorTerminal(port=args.monitor_port, ack_port=args.ack_port)
         monitor.run()
     else:
         client = RoverControlClient(
