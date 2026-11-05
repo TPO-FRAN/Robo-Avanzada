@@ -20,7 +20,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-SERVER_IP    = "192.168.1.16"
+SERVER_IP    = "172.31.60.222"
 SERVER_PORT  = 2222
 MONITOR_PORT = 0  # 0 = conflict-free OS-assigned ephemeral UDP port
 BUF_SIZE     = 2048
@@ -291,24 +291,24 @@ class RoverControlClient:
         print("=" * 74)
         print("  TERMINAL DE COMANDOS DEL ROVER — CLIENTE LAPTOP (UA62 - Avance 2)")
         print("-" * 74)
-        print("  Comandos de Movilidad (4x MG996R Continuos, Ruedas 87.5 mm):")
-        print("    MOVE-FORWARD <0-100>          Ej: MOVE-FORWARD 50")
-        print("    MOVE-BACKWARD <0-100>         Ej: MOVE-BACKWARD 50")
-        print("    TURN-RIGHT <grados_IMU>       Ej: TURN-RIGHT 20      (Giro exacto con MPU-6050)")
-        print("    TURN-LEFT <grados_IMU>        Ej: TURN-LEFT 20       (Giro exacto con MPU-6050)")
-        print("    TURN-RIGHT <vel_izq> <vel_der> Ej: TURN-RIGHT 80 20  (Giro diferencial)")
-        print("    TURN-LEFT <vel_izq> <vel_der>  Ej: TURN-LEFT 20 80   (Giro diferencial)")
-        print("    STOP                          Detiene todas las ruedas y servos")
+        print("  Comandos de Movilidad (4x MG996R Continuos con PCA9685):")
+        print("    ADELANTE [0-100]              Ej: ADELANTE 50 (Avance recto a velocidad fija)")
+        print("    ATRAS [0-100]                 Ej: ATRAS 40    (Retroceso recto)")
+        print("    GIRARD <1-100>                Ej: GIRARD 30   (Giro diferencial der: Izq=+30, Der=-30)")
+        print("    GIRARI <1-100>                Ej: GIRARI 30   (Giro diferencial izq: Izq=-30, Der=+30)")
+        print("    ALTO                          Detiene ruedas y brazo (alias: STOP, PARAR)")
         print("-" * 74)
-        print("  Comandos del Brazo Robótico (2 GDL - 2x MG996R Estándar):")
-        print("    ARM-EXTEND  (o ARM-DEPLOYMENT) Extiende suavemente el brazo robótico")
-        print("    ARM-RETRIEVE (o ARM-HOME)      Regresa suavemente el brazo a posición home")
-        print("    ARM <base 0-180> <codo 0-180>  Ej: ARM 90 120")
+        print("  Comandos del Brazo Robótico (2 GDL con PCA9685):")
+        print("    BRAZOEXT                      Extiende el brazo suavemente (alias: ARM-EXTEND)")
+        print("    BRAZOH                        Regresa el brazo a posición home (alias: ARM-HOME)")
+        print("    BRAZO <base 0-180> <codo 0-180> Ej: BRAZO 90 120")
         print("-" * 74)
-        print("  Sensores y Sistema:")
-        print("    STATUS                        Consulta IMU MPU-6050 y Ultrasónicos HC-SR04")
-        print("    HELP                          Muestra esta ayuda")
-        print("    QUIT (o q)                    Detiene el rover y cierra el cliente")
+        print("  Sensores y Giros en Grados (IMU MPU-6050):")
+        print("    GIROD <1-360>                 Ej: GIROD 20    (Giro cerrado 20° a la derecha)")
+        print("    GIROI <1-360>                 Ej: GIROI 20    (Giro cerrado 20° a la izquierda)")
+        print("    ESTADO                        Consulta IMU y Ultrasónicos (alias: STATUS)")
+        print("    AYUDA                         Muestra esta ayuda (alias: HELP, h)")
+        print("    SALIR                         Detiene el rover y cierra el cliente (alias: QUIT, q)")
         print("=" * 74)
 
     def run_cli(self):
@@ -329,19 +329,19 @@ class RoverControlClient:
                     continue
 
                 low = entry.lower()
-                if low in ("q", "quit", "exit"):
-                    print("  [INFO] Enviando STOP de seguridad y cerrando...")
-                    self.send_command("STOP")
+                if low in ("q", "quit", "exit", "salir"):
+                    print("  [INFO] Enviando ALTO de seguridad y cerrando...")
+                    self.send_command("ALTO")
                     time.sleep(0.2)
                     break
-                if low in ("help", "h", "?"):
+                if low in ("help", "h", "?", "ayuda"):
                     self._print_help()
                     continue
 
                 self.send_command(entry)
         except KeyboardInterrupt:
-            print("\n  [INFO] Interrupción detectada. Enviando STOP...")
-            self.send_command("STOP")
+            print("\n  [INFO] Interrupción detectada. Enviando ALTO...")
+            self.send_command("ALTO")
             time.sleep(0.2)
         finally:
             self.close()

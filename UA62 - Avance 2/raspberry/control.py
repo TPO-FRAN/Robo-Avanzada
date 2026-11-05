@@ -310,7 +310,7 @@ class RoverController:
     Validates all human-readable commands locally, sends compact 1-letter opcodes (`W`, `G`, `A`, `X`, `?`)
     over UART to the Arduino Uno, and formats natural Spanish responses for the Laptop client.
     """
-    STOP_ALIASES = frozenset({"STOP", "DETENER", "PARAR"})
+    STOP_ALIASES = frozenset({"STOP", "DETENER", "PARAR", "ALTO"})
 
     def __init__(
         self,
@@ -368,102 +368,145 @@ class RoverController:
         args = tokens[1:]
 
         alias_map = {
-            "FORWARD":    "MOVE-FORWARD",
-            "FWD":        "MOVE-FORWARD",
-            "AVANZAR":    "MOVE-FORWARD",
-            "BACKWARD":   "MOVE-BACKWARD",
-            "BWD":        "MOVE-BACKWARD",
-            "RETROCEDER": "MOVE-BACKWARD",
-            "RIGHT":      "TURN-RIGHT",
-            "LEFT":       "TURN-LEFT",
-            "EXTEND":     "ARM-EXTEND",
-            "DEPLOY":     "ARM-DEPLOYMENT",
-            "RETRIEVE":   "ARM-RETRIEVE",
-            "RETREIVE":   "ARM-RETREIVE",
-            "HOME":       "ARM-HOME",
-            "DETENER":    "STOP",
-            "PARAR":      "STOP",
+            "ADELANTE":        "ADELANTE",
+            "FORWARD":         "ADELANTE",
+            "FWD":             "ADELANTE",
+            "AVANZAR":         "ADELANTE",
+            "MOVE-FORWARD":    "ADELANTE",
+            "ATRAS":           "ATRAS",
+            "BACKWARD":        "ATRAS",
+            "BWD":             "ATRAS",
+            "RETROCEDER":      "ATRAS",
+            "MOVE-BACKWARD":   "ATRAS",
+            "GIRARD":          "GIRARD",
+            "GIRARI":          "GIRARI",
+            "TURN-RIGHT":      "GIRARD",
+            "TURN-LEFT":       "GIRARI",
+            "RIGHT":           "GIRARD",
+            "LEFT":            "GIRARI",
+            "BRAZOEXT":        "BRAZOEXT",
+            "EXTEND":          "BRAZOEXT",
+            "DEPLOY":          "BRAZOEXT",
+            "ARM-EXTEND":      "BRAZOEXT",
+            "ARM-DEPLOYMENT":  "BRAZOEXT",
+            "BRAZOH":          "BRAZOH",
+            "HOME":            "BRAZOH",
+            "RETRIEVE":        "BRAZOH",
+            "RETREIVE":        "BRAZOH",
+            "ARM-RETRIEVE":    "BRAZOH",
+            "ARM-RETREIVE":    "BRAZOH",
+            "ARM-HOME":        "BRAZOH",
+            "ALTO":            "ALTO",
+            "DETENER":         "ALTO",
+            "PARAR":           "ALTO",
+            "STOP":            "ALTO",
+            "ESTADO":          "ESTADO",
+            "STATUS":          "ESTADO",
+            "LEER":            "ESTADO",
+            "READ":            "ESTADO",
+            "GIROD":           "GIROD",
+            "GIROI":           "GIROI",
         }
         verb = alias_map.get(verb, verb)
 
-        if verb == "MOVE" and args and args[0] in ("FORWARD", "BACKWARD"):
-            verb, args = f"MOVE-{args[0]}", args[1:]
-        elif verb == "TURN" and args and args[0] in ("RIGHT", "LEFT"):
-            verb, args = f"TURN-{args[0]}", args[1:]
-        elif verb == "ARM" and args and args[0] in ("EXTEND", "DEPLOYMENT", "RETRIEVE", "RETREIVE", "HOME"):
-            verb, args = f"ARM-{args[0]}", args[1:]
+        if verb == "MOVE" and args and args[0] in ("FORWARD", "BACKWARD", "ADELANTE", "ATRAS"):
+            sub = "ADELANTE" if args[0] in ("FORWARD", "ADELANTE") else "ATRAS"
+            verb, args = sub, args[1:]
+        elif verb in ("TURN", "GIRAR") and args and args[0] in ("RIGHT", "LEFT", "D", "I", "DER", "IZQ", "DERECHA", "IZQUIERDA"):
+            sub = "GIRARD" if args[0] in ("RIGHT", "D", "DER", "DERECHA") else "GIRARI"
+            verb, args = sub, args[1:]
+        elif verb in ("ARM", "BRAZO") and args and args[0] in ("EXTEND", "DEPLOYMENT", "EXT", "RETRIEVE", "RETREIVE", "HOME", "H"):
+            sub = "BRAZOEXT" if args[0] in ("EXTEND", "DEPLOYMENT", "EXT") else "BRAZOH"
+            verb, args = sub, args[1:]
 
-        # 1. STOP
-        if verb == "STOP":
+        # 1. ALTO / STOP
+        if verb == "ALTO":
             if len(args) == 0:
                 return ("X", "STOP")
-            return ("[ERROR] Sintaxis invalida. Usa: STOP", "ERROR")
+            return ("[ERROR] Sintaxis invalida. Usa: ALTO (o STOP)", "ERROR")
 
-        # 2. STATUS / READ
-        if verb in ("STATUS", "READ"):
+        # 2. ESTADO / STATUS / READ
+        if verb == "ESTADO":
             if len(args) == 0:
                 return ("?", "STATUS")
-            return ("[ERROR] Sintaxis invalida. Usa: STATUS", "ERROR")
+            return ("[ERROR] Sintaxis invalida. Usa: ESTADO (o STATUS)", "ERROR")
 
-        # 3. ARM-EXTEND / ARM-DEPLOYMENT
-        if verb in ("ARM-EXTEND", "ARM-DEPLOYMENT"):
+        # 3. BRAZOEXT (Extender brazo suavemente)
+        if verb == "BRAZOEXT":
             if len(args) == 0:
                 return (f"A {ARM_BASE_EXTEND} {ARM_ELBOW_EXTEND}", "ARM_EXTEND")
-            return (f"[ERROR] Sintaxis invalida. Usa: {verb}", "ERROR")
+            return ("[ERROR] Sintaxis invalida. Usa: BRAZOEXT", "ERROR")
 
-        # 4. ARM-RETRIEVE / ARM-RETREIVE / ARM-HOME
-        if verb in ("ARM-RETRIEVE", "ARM-RETREIVE", "ARM-HOME"):
+        # 4. BRAZOH (Regresar brazo a home)
+        if verb == "BRAZOH":
             if len(args) == 0:
                 return (f"A {ARM_BASE_HOME} {ARM_ELBOW_HOME}", "ARM_HOME")
-            return (f"[ERROR] Sintaxis invalida. Usa: {verb}", "ERROR")
+            return ("[ERROR] Sintaxis invalida. Usa: BRAZOH", "ERROR")
 
-        # 5. ARM <base 0-180> <elbow 0-180>
-        if verb == "ARM":
+        # 5. BRAZO / ARM <base 0-180> <codo 0-180>
+        if verb in ("BRAZO", "ARM"):
             if len(args) == 2 and cls._is_int(args[0]) and cls._is_int(args[1]):
                 b, e = int(args[0]), int(args[1])
                 if 0 <= b <= 180 and 0 <= e <= 180:
                     return (f"A {b} {e}", "ARM_ANGLES")
-            return ("[ERROR] Sintaxis invalida. Usa: ARM <base 0-180> <codo 0-180>", "ERROR")
+            return ("[ERROR] Sintaxis invalida. Usa: BRAZO <base 0-180> <codo 0-180>", "ERROR")
 
-        # 6. MOVE-FORWARD / MOVE-BACKWARD
-        if verb in ("MOVE-FORWARD", "MOVE-BACKWARD"):
-            is_fwd = verb == "MOVE-FORWARD"
+        # 6. ADELANTE / ATRAS [0-100]
+        if verb in ("ADELANTE", "ATRAS"):
+            is_fwd = (verb == "ADELANTE")
             spd = 50
             if len(args) == 1:
                 if not cls._is_int(args[0]):
                     return (f"[ERROR] Velocidad invalida. Usa: {verb} <0-100>", "ERROR")
                 spd = int(args[0])
                 if not (0 <= spd <= 100):
-                    return (f"[ERROR] Velocidad invalida. Usa: {verb} <0-100>", "ERROR")
+                    return (f"[ERROR] Velocidad fuera de rango (0-100). Usa: {verb} <0-100>", "ERROR")
             elif len(args) > 1:
-                return (f"[ERROR] Velocidad invalida. Usa: {verb} <0-100>", "ERROR")
+                return (f"[ERROR] Sintaxis invalida. Usa: {verb} [0-100]", "ERROR")
 
             signed_spd = spd if is_fwd else -spd
             intent = "MOVE_FORWARD" if is_fwd else "MOVE_BACKWARD"
             return (f"W {signed_spd} {signed_spd}", intent)
 
-        # 7. TURN-RIGHT / TURN-LEFT (Gyro angle OR Differential wheel speeds)
-        if verb in ("TURN-RIGHT", "TURN-LEFT"):
-            is_right = verb == "TURN-RIGHT"
-            if len(args) == 0:
-                ddeg = 200 if is_right else -200
-                return (f"G {ddeg}", "TURN_GYRO")
+        # 7. GIRARD / GIRARI <vel> (Giro diferencial sobre su propio eje con valor unico de velocidad)
+        if verb in ("GIRARD", "GIRARI"):
+            is_right = (verb == "GIRARD")
+            spd = 50
+            if len(args) == 1:
+                if not cls._is_int(args[0]):
+                    return (f"[ERROR] Velocidad invalida. Usa: {verb} <1-100>", "ERROR")
+                spd = int(args[0])
+                if not (0 <= spd <= 100):
+                    return (f"[ERROR] Velocidad fuera de rango (0-100). Usa: {verb} <1-100>", "ERROR")
+            elif len(args) == 2 and cls._is_int(args[0]) and cls._is_int(args[1]):
+                # Compatibilidad heredada con giro diferencial asimetrico W <v1> <v2>
+                v1, v2 = int(args[0]), int(args[1])
+                if -100 <= v1 <= 100 and -100 <= v2 <= 100:
+                    intent = "TURN_DIFF_RIGHT" if is_right else "TURN_DIFF_LEFT"
+                    return (f"W {v1} {v2}", intent)
+            elif len(args) > 2:
+                return (f"[ERROR] Sintaxis invalida. Usa un solo valor de velocidad: {verb} <1-100>", "ERROR")
 
+            if spd == 0:
+                return ("W 0 0", "STOP")
+
+            # GIRARD: Izq = +spd (fwd), Der = -spd (rev) -> giro a la derecha en su eje
+            # GIRARI: Izq = -spd (rev), Der = +spd (fwd) -> giro a la izquierda en su eje
+            left_spd = spd if is_right else -spd
+            right_spd = -spd if is_right else spd
+            intent = "TURN_DIFF_RIGHT" if is_right else "TURN_DIFF_LEFT"
+            return (f"W {left_spd} {right_spd}", intent)
+
+        # 8. GIROD / GIROI <grados> (Giro exacto en lazo cerrado con IMU MPU-6050)
+        if verb in ("GIROD", "GIROI"):
+            is_right = (verb == "GIROD")
             if len(args) == 1 and cls._is_float(args[0]):
                 deg = float(args[0])
                 if 0.0 < deg <= 360.0:
                     abs_ddeg = max(1, int(round(deg * 10.0)))
                     ddeg = abs_ddeg if is_right else -abs_ddeg
                     return (f"G {ddeg}", "TURN_GYRO")
-                return (f"[ERROR] Sintaxis invalida. Usa: {verb} <1-360> o {verb} <izq> <der>", "ERROR")
-
-            if len(args) == 2 and cls._is_int(args[0]) and cls._is_int(args[1]):
-                v1, v2 = int(args[0]), int(args[1])
-                if -100 <= v1 <= 100 and -100 <= v2 <= 100:
-                    intent = "TURN_DIFF_RIGHT" if is_right else "TURN_DIFF_LEFT"
-                    return (f"W {v1} {v2}", intent)
-
-            return (f"[ERROR] Sintaxis invalida. Usa: {verb} <1-360> o {verb} <izq> <der>", "ERROR")
+            return (f"[ERROR] Sintaxis invalida. Usa: {verb} <1-360 grados>", "ERROR")
 
         return (f"[ERROR] Comando desconocido: {clean}", "ERROR")
 
@@ -510,6 +553,9 @@ class RoverController:
                     mps = RoverKinematics.speed_pct_to_mps(spd)
                     return f"Retrocedí a {spd}% de velocidad ({mps:.2f} m/s con ruedas de 87.5 mm)"
                 direction = "la derecha" if intent == "TURN_DIFF_RIGHT" else "la izquierda"
+                if abs(l_spd) == abs(r_spd):
+                    pct_val = abs(l_spd)
+                    return f"Girando a {direction} con giro diferencial al {pct_val}% (Izq: {l_spd}%, Der: {r_spd}%)"
                 return f"Girando a {direction} con velocidad diferencial (Izq: {l_spd}%, Der: {r_spd}%)"
 
             if op == "G" and len(parts) >= 3:
