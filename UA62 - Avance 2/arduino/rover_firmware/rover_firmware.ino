@@ -6,13 +6,14 @@
   Hardware & Bus Layout:
     - I2C Bus (400 kHz, SDA=A4, SCL=A5):
         * PCA9685 16-Ch 12-Bit PWM Driver @ 0x40 (50 Hz servo refresh):
-            - CH 0 : Wheel FL (Front-Left  / Delantera Izquierda, Continuous MG996R)
-            - CH 1 : Wheel RL (Rear-Left   / Trasera Izquierda,   Continuous MG996R)
-            - CH 2 : Wheel FR (Front-Right / Delantera Derecha,   Continuous MG996R, inverted)
-            - CH 3 : Wheel RR (Rear-Right  / Trasera Derecha,     Continuous MG996R, inverted)
+            - CH 0 : Wheel FL (Front-Left  / Delantera Izquierda, Continuous MG996R, inverted)
+            - CH 1 : Wheel RL (Rear-Left   / Trasera Izquierda,   Continuous MG996R, inverted)
+            - CH 2 : Wheel FR (Front-Right / Delantera Derecha,   Continuous MG996R)
+            - CH 3 : Wheel RR (Rear-Right  / Trasera Derecha,     Continuous MG996R)
             - CH 4 : Arm Base  (Standard MG996R, 0..180 deg, smooth ramp)
             - CH 5 : Arm Elbow (Standard MG996R, 0..180 deg, smooth ramp)
-        * MPU-6050 6-DoF IMU @ 0x68 (500 Hz fixed-point trapezoidal gyro Z integration)
+        * GY-511 (LSM303DLHC 3-Axis Magnetometer / Digital Compass @ 0x1E):
+            - Pinout: VCC -> 5V, GND -> GND, SCL -> A5 (PC5), SDA -> A4 (PC4)
     - Ultrasonic Sensors (2x HC-SR04 via PCINT2, N=5 median FIFO):
         * US1 : TRIG1 = D2, ECHO1 = D3 (PCINT19)
         * US2 : TRIG2 = D4, ECHO2 = D5 (PCINT21)
@@ -26,7 +27,7 @@
     - BRAZOH                              : Retorno de brazo a home
     - ALTO                  / X           : Parada inmediata (FULL_OFF o centerUs + brazo congelado)
     - ESTADO                / ?           : Consulta de telemetría STATUS
-    - GIROD / GIROI <grados>/ G <ddeg>    : Giro exacto en lazo cerrado con IMU MPU-6050
+    - GIROD / GIROI <grados>/ G <ddeg>    : Giro exacto en lazo cerrado con brújula GY-511
 
   Online Calibration Commands (Arduino Serial Monitor @ 115200, "Newline"):
     - P <0-3> <us>          : Raw PWM (1000..2000 us) on single wheel (0=FL,1=RL,2=FR,3=RR)
@@ -80,7 +81,7 @@ constexpr bool     STOP_CON_DETACH = true; // true: PCA9685 FULL_OFF on stop; fa
 // Matches arduino/servo_calibration/servo_calibration.ino binary layout in EEPROM.
 struct WheelCal {
   uint8_t channel;      // PCA9685 channel (0=FL, 1=RL, 2=FR, 3=RR)
-  uint8_t inverted;     // 0 = normal (Left side), 1 = inverted (Right side)
+  uint8_t inverted;     // 0 = normal, 1 = inverted
   int16_t centerUs;     // Exact neutral stop pulse in us (wheel does NOT creep)
   int16_t fwdStartOff;  // +us offset from centerUs where wheel starts spinning FWD (5%)
   int16_t revStartOff;  // +us offset from centerUs where wheel starts spinning REV (-5%)
@@ -94,10 +95,10 @@ struct WheelCal {
 // Copy-paste the table printed by `servo_calibration.ino` (`SHOW`) here if desired.
 constexpr WheelCal DEFAULT_WHEEL_CAL[NUM_WHEELS] = {
   // ch,          inv, center, fStart, rStart, fMid, rMid, fMax, rMax
-  { CH_WHEEL_FL,   0,   1500,     30,     30,   95,   95,  180,  180 }, // 0: FL
-  { CH_WHEEL_RL,   0,   1500,     30,     30,   95,   95,  180,  180 }, // 1: RL
-  { CH_WHEEL_FR,   1,   1500,     30,     30,   95,   95,  180,  180 }, // 2: FR
-  { CH_WHEEL_RR,   1,   1500,     30,     30,   95,   95,  180,  180 }  // 3: RR
+  { CH_WHEEL_FL,   1,   1500,     30,     30,   95,   95,  180,  180 }, // 0: FL
+  { CH_WHEEL_RL,   1,   1500,     30,     30,   95,   95,  180,  180 }, // 1: RL
+  { CH_WHEEL_FR,   0,   1500,     30,     30,   95,   95,  180,  180 }, // 2: FR
+  { CH_WHEEL_RR,   0,   1500,     30,     30,   95,   95,  180,  180 }  // 3: RR
 };
 
 struct EepromCalBlob {
@@ -208,65 +209,128 @@ public:
   }
 };
 
-// ── Class 2: MPU-6050 Gyro Z (Fixed-Point Trapezoidal Integration in 0.1 deg)
+// ── Class 2: GY-511 LSM303DLHC Digital Compass (Absolute Heading in 0.1 deg) ──
 class ImuSensor {
-  // +/-500 dps => 65.5 LSB/dps => 0.1 deg = 13,100,000 units of (2*LSB * us)
-  static constexpr int32_t TENTH_DEG_UNIT = 13100000L;
+  static constexpr uint8_t MAG_ADDR = 0x1E;
   bool     _ok = false;
   uint8_t  _fails = 0;
-  int16_t  _bias = 0, _prevCorr = 0;
-  int32_t  _rem = 0, _yawDdeg = 0, _turnDdeg = 0;
-  uint32_t _lastUs = 0;
+  int16_t  _yawDdeg = 0;         // 0..3599 (0.1 deg absolute compass heading)
+  int16_t  _lastCompassYaw = 0;
+  int32_t  _turnDdeg = 0;        // Continuous accumulated relative turn in 0.1 deg
+  uint32_t _lastMs = 0;
 
   static bool _write(uint8_t reg, uint8_t val) {
-    Wire.beginTransmission(0x68); Wire.write(reg); Wire.write(val);
-    return Wire.endTransmission() == 0;
-  }
-
-  static bool _readGz(int16_t &gz) {
-    Wire.beginTransmission(0x68); Wire.write(0x47);
-    if (Wire.endTransmission(false) != 0 || Wire.requestFrom((uint8_t)0x68, (uint8_t)2) != 2) {
+    Wire.beginTransmission(MAG_ADDR);
+    Wire.write(reg);
+    Wire.write(val);
+    if (Wire.endTransmission(true) != 0) {
       #if defined(WIRE_HAS_TIMEOUT)
       Wire.clearWireTimeoutFlag();
       #endif
       return false;
     }
-    gz = (int16_t)((Wire.read() << 8) | Wire.read());
     return true;
+  }
+
+  static bool _readMag(int16_t &x, int16_t &y) {
+    Wire.beginTransmission(MAG_ADDR);
+    Wire.write(0x03); // OUT_X_H_M
+    // Always send STOP (true) so a NACK never leaves the shared I2C bus locked before PCA9685 writes
+    if (Wire.endTransmission(true) != 0) {
+      #if defined(WIRE_HAS_TIMEOUT)
+      Wire.clearWireTimeoutFlag();
+      #endif
+      return false;
+    }
+    if (Wire.requestFrom(MAG_ADDR, (uint8_t)6) != 6) {
+      #if defined(WIRE_HAS_TIMEOUT)
+      Wire.clearWireTimeoutFlag();
+      #endif
+      return false;
+    }
+    // LSM303DLHC register sequence: X_H, X_L, Z_H, Z_L, Y_H, Y_L
+    uint8_t xh = (uint8_t)Wire.read();
+    uint8_t xl = (uint8_t)Wire.read();
+    (void)Wire.read(); // Skip Z_H
+    (void)Wire.read(); // Skip Z_L
+    uint8_t yh = (uint8_t)Wire.read();
+    uint8_t yl = (uint8_t)Wire.read();
+
+    int16_t rx = (int16_t)(((uint16_t)xh << 8) | xl);
+    int16_t ry = (int16_t)(((uint16_t)yh << 8) | yl);
+
+    // Reject ADC overflow (-4096 / 0xF000 per LSM303DLHC datasheet Sec 7.2.4) or null vector
+    if (rx == -4096 || ry == -4096 || (rx == 0 && ry == 0)) return false;
+
+    x = rx;
+    y = ry;
+    return true;
+  }
+
+  static int16_t _calcHeading(int16_t x, int16_t y) {
+    float rad = atan2((float)y, (float)x);
+    int16_t ddeg = (int16_t)(rad * (1800.0f / 3.14159265f));
+    if (ddeg < 0) ddeg += 3600;
+    return ddeg;
   }
 
 public:
   void init() {
-    if (!_write(0x6B, 0x00)) return;
-    delay(10);
-    _write(0x1A, 0x03); // 44 Hz DLPF
-    _write(0x1B, 0x08); // +/- 500 dps
-    int32_t sum = 0; uint8_t n = 0;
-    for (uint8_t i = 0; i < 128; i++) {
-      int16_t raw;
-      if (_readGz(raw)) { sum += raw; n++; }
-      delayMicroseconds(1200);
+    _ok = false;
+    _fails = 0;
+    _turnDdeg = 0;
+
+    // CRA_REG_M (0x00): 75 Hz data rate (0x18)
+    if (!_write(0x00, 0x18)) return;
+    // CRB_REG_M (0x01): +/- 1.9 Gauss gain (0x40) to avoid saturation near servo magnets
+    if (!_write(0x01, 0x40)) return;
+    // MR_REG_M (0x02): Continuous-conversion mode (0x00)
+    if (!_write(0x02, 0x00)) return;
+    delay(15);
+
+    int16_t x, y;
+    if (_readMag(x, y)) {
+      _ok = true;
+      int16_t h = _calcHeading(x, y);
+      _yawDdeg = h;
+      _lastCompassYaw = h;
+      _turnDdeg = 0;
     }
-    if (n >= 64) { _ok = true; _bias = (int16_t)(sum / n); }
-    _lastUs = micros();
+    _lastMs = millis();
   }
 
   void update() {
-    uint32_t now = micros(), dt = now - _lastUs;
-    _lastUs = now;
-    if (!_ok || dt == 0 || dt > 30000UL) return;
-    int16_t raw;
-    if (!_readGz(raw)) { if (++_fails >= 10) _ok = false; return; }
+    uint32_t now = millis();
+    if (!_ok || (now - _lastMs < 13)) return; // 75 Hz ODR (~13.3 ms); do not touch I2C if sensor unavailable
+    _lastMs = now;
+
+    int16_t x, y;
+    if (!_readMag(x, y)) {
+      if (++_fails >= 10) _ok = false;
+      return;
+    }
     _fails = 0;
-    int16_t corr = raw - _bias;
-    if (corr > -23 && corr < 23) corr = 0; // 0.35 dps deadzone
-    _rem += ((int32_t)_prevCorr + corr) * (int32_t)dt;
-    _prevCorr = corr;
-    while (_rem >= TENTH_DEG_UNIT)  { _rem -= TENTH_DEG_UNIT; _yawDdeg++; _turnDdeg++; }
-    while (_rem <= -TENTH_DEG_UNIT) { _rem += TENTH_DEG_UNIT; _yawDdeg--; _turnDdeg--; }
+
+    int16_t curYaw = _calcHeading(x, y);
+    int16_t diff = curYaw - _lastCompassYaw;
+    if (diff > 1800)       diff -= 3600;
+    else if (diff < -1800) diff += 3600;
+
+    _lastCompassYaw = curYaw;
+    _yawDdeg = curYaw;
+    _turnDdeg += diff;
   }
 
-  void resetTurn() { _turnDdeg = 0; _rem = 0; _prevCorr = 0; _lastUs = micros(); }
+  void resetTurn() {
+    _turnDdeg = 0;
+    int16_t x, y;
+    if (_ok && _readMag(x, y)) {
+      _yawDdeg = _calcHeading(x, y);
+      _lastMs = millis();
+    }
+    _lastCompassYaw = _yawDdeg;
+  }
+
   bool ok() const { return _ok; }
   int32_t yawDdeg() const { return _yawDdeg; }
   int16_t turnedAbsDdeg() const { return (int16_t)(_turnDdeg < 0 ? -_turnDdeg : _turnDdeg); }

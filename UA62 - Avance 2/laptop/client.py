@@ -20,7 +20,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-SERVER_IP    = "172.31.60.222"
+SERVER_IP    = "172.31.60.78"
 SERVER_PORT  = 2222
 MONITOR_PORT = 0  # 0 = conflict-free OS-assigned ephemeral UDP port
 BUF_SIZE     = 2048
