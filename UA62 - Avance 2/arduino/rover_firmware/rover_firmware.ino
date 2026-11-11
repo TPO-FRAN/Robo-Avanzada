@@ -95,10 +95,10 @@ struct WheelCal {
 // Copy-paste the table printed by `servo_calibration.ino` (`SHOW`) here if desired.
 constexpr WheelCal DEFAULT_WHEEL_CAL[NUM_WHEELS] = {
   // ch,          inv, center, fStart, rStart, fMid, rMid, fMax, rMax
-  { CH_WHEEL_FL,   1,   1500,     30,     30,   95,   95,  180,  180 }, // 0: FL
-  { CH_WHEEL_RL,   1,   1500,     30,     30,   95,   95,  180,  180 }, // 1: RL
-  { CH_WHEEL_FR,   0,   1500,     30,     30,   95,   95,  180,  180 }, // 2: FR
-  { CH_WHEEL_RR,   0,   1500,     30,     30,   95,   95,  180,  180 }  // 3: RR
+  { CH_WHEEL_FL,   1,   1550,     15,     15,   25,   25,  50,  50 }, // 0: FL
+  { CH_WHEEL_RL,   1,   1550,     15,     15,   25,   25,  50,  50 }, // 1: RL
+  { CH_WHEEL_FR,   0,   1550,     15,     15,   25,   25,  50,  50 }, // 2: FR
+  { CH_WHEEL_RR,   0,   1550,     15,     15,   25,   25,  50,  50 }  // 3: RR
 };
 
 struct EepromCalBlob {
