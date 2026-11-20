@@ -6,10 +6,10 @@
   Hardware & Bus Layout:
     - I2C Bus (400 kHz, SDA=A4, SCL=A5):
         * PCA9685 16-Ch 12-Bit PWM Driver @ 0x40 (50 Hz servo refresh):
-            - CH 0 : Wheel FL (Front-Left  / Delantera Izquierda, Continuous MG996R, inverted)
-            - CH 1 : Wheel RL (Rear-Left   / Trasera Izquierda,   Continuous MG996R, inverted)
-            - CH 2 : Wheel FR (Front-Right / Delantera Derecha,   Continuous MG996R)
-            - CH 3 : Wheel RR (Rear-Right  / Trasera Derecha,     Continuous MG996R)
+            - CH 0 : Wheel FL (Front-Left  / Delantera Izquierda, Continuous MG996R)
+            - CH 1 : Wheel RL (Rear-Left   / Trasera Izquierda,   Continuous MG996R)
+            - CH 2 : Wheel FR (Front-Right / Delantera Derecha,   Continuous MG996R, inverted)
+            - CH 3 : Wheel RR (Rear-Right  / Trasera Derecha,     Continuous MG996R, inverted)
             - CH 4 : Arm Base  (Standard MG996R, 0..180 deg, smooth ramp)
             - CH 5 : Arm Elbow (Standard MG996R, 0..180 deg, smooth ramp)
         * GY-511 (LSM303DLHC 3-Axis Magnetometer / Digital Compass @ 0x1E):
@@ -38,6 +38,7 @@
     - O [hz]                : Query or set PCA9685 real oscillator frequency (20000000..30000000 Hz)
     - D <0|1>               : Stop mode: 1 = PCA9685 FULL_OFF (0 pulses), 0 = send calibrated centerUs
     - E [0]                 : Save active calibration to EEPROM (E 0 = restore defaults)
+    - I [ox oy | C | 0]     : Query IMU raw/cal state, set offsets, auto-cal 360 (I C), or reset (I 0)
     - K                     : Print active 4-wheel calibration & EEPROM/PCA9685 state
     - STOP (or S)           : Stop all wheels (same as X)
 */
@@ -73,8 +74,10 @@ constexpr int16_t  PWM_MIN_US    = 1000, PWM_MAX_US    = 2000;
 constexpr uint16_t US_TIMEOUT_US = 15000U;
 constexpr uint16_t OBS_TRIG_MM   = 200U;  // 20.0 cm
 constexpr uint16_t OBS_CLEAR_MM  = 250U;  // 25.0 cm
-constexpr uint8_t  TURN_MAX_SPD  = 50,   TURN_MIN_SPD  = 28;
-constexpr int8_t   ZONA_MUERTA   = 5;     // |pct| below this is treated as 0 (STOP)
+constexpr uint8_t  TURN_MAX_SPD   = 100,  TURN_MIN_SPD  = 45;
+constexpr int16_t  TURN_SLOW_DDEG = 180;  // Progressive ramp from 100% to 45% within the last 18.0 deg
+constexpr uint8_t  TURN_SETTLE_MS = 65;   // Blank initial 65 ms (5 samples @ 75 Hz) motor inrush current spike
+constexpr int8_t   ZONA_MUERTA    = 5;    // |pct| below this is treated as 0 (STOP)
 constexpr bool     STOP_CON_DETACH = true; // true: PCA9685 FULL_OFF on stop; false: send centerUs
 
 // ── Per-Wheel Independent Calibration Structure & EEPROM Persistence ─────────
@@ -95,10 +98,10 @@ struct WheelCal {
 // Copy-paste the table printed by `servo_calibration.ino` (`SHOW`) here if desired.
 constexpr WheelCal DEFAULT_WHEEL_CAL[NUM_WHEELS] = {
   // ch,          inv, center, fStart, rStart, fMid, rMid, fMax, rMax
-  { CH_WHEEL_FL,   1,   1550,     15,     15,   25,   25,  50,  50 }, // 0: FL
-  { CH_WHEEL_RL,   1,   1550,     15,     15,   25,   25,  50,  50 }, // 1: RL
-  { CH_WHEEL_FR,   0,   1550,     15,     15,   25,   25,  50,  50 }, // 2: FR
-  { CH_WHEEL_RR,   0,   1550,     15,     15,   25,   25,  50,  50 }  // 3: RR
+  { CH_WHEEL_FL,   0,   1550,     15,     15,   25,   25,  50,  50 }, // 0: FL
+  { CH_WHEEL_RL,   0,   1550,     15,     15,   25,   25,  50,  50 }, // 1: RL
+  { CH_WHEEL_FR,   1,   1535,     15,     15,   25,   25,  50,  50 }, // 2: FR
+  { CH_WHEEL_RR,   1,   1550,     15,     15,   25,   25,  50,  50 }  // 3: RR
 };
 
 struct EepromCalBlob {
@@ -210,14 +213,87 @@ public:
 };
 
 // ── Class 2: GY-511 LSM303DLHC Digital Compass (Absolute Heading in 0.1 deg) ──
+struct ImuCalBlob {
+  uint16_t magic; // 0x1B62 (stored separately from EepromCalBlob to preserve wheel calibration)
+  int16_t  offX;
+  int16_t  offY;
+  uint16_t crc;
+};
+
+constexpr uint16_t IMU_EEPROM_MAGIC    = 0x1B62U;
+constexpr int      IMU_EEPROM_ADDR     = 128;
+constexpr int16_t  IMU_GLITCH_DDEG     = 450; // Reject transient jumps > 45.0 deg per 13 ms sample
+constexpr int16_t  IMU_MIN_SPAN_LSB    = 150; // Min X/Y diameter to auto-center uncalibrated hard-iron offsets
+
 class ImuSensor {
   static constexpr uint8_t MAG_ADDR = 0x1E;
   bool     _ok = false;
+  bool     _settling = false;
+  bool     _hasEepromCal = false;
+  bool     _turnIsRight = true;
   uint8_t  _fails = 0;
+  uint8_t  _settleSamples = 0;
+  uint8_t  _glitchCnt = 0;
+  uint8_t  _histIdx = 0;
+  int8_t   _rightSign = 0;       // Learned yaw polarity for GIROD (+1 or -1)
+  int16_t  _offX = 0, _offY = 0;
+  int16_t  _rawX = 0, _rawY = 0;
+  int16_t  _hx[5] = { 0, 0, 0, 0, 0 };
+  int16_t  _hy[5] = { 0, 0, 0, 0, 0 };
+  int16_t  _filtX = 0, _filtY = 0;
+  int16_t  _minX = 32767, _maxX = -32767;
+  int16_t  _minY = 32767, _maxY = -32767;
   int16_t  _yawDdeg = 0;         // 0..3599 (0.1 deg absolute compass heading)
   int16_t  _lastCompassYaw = 0;
-  int32_t  _turnDdeg = 0;        // Continuous accumulated relative turn in 0.1 deg
+  int32_t  _turnDdeg = 0;        // Direction-guarded accumulated relative turn in 0.1 deg
+  int32_t  _rawTurnDdeg = 0;     // Unclamped accumulated turn in 0.1 deg (for polarity self-check)
+  int16_t  _prevTurned1 = 0;     // n-1 sample |turnDdeg|
+  int16_t  _prevTurned2 = 0;     // n-2 sample |turnDdeg| (3-sample setpoint confirmation)
   uint32_t _lastMs = 0;
+  uint32_t _settleStartMs = 0;
+
+  static int16_t _median5(const int16_t* f) {
+    int16_t c[5] = { f[0], f[1], f[2], f[3], f[4] };
+    for (uint8_t i = 1; i < 5; i++) {
+      int16_t k = c[i]; int8_t j = i - 1;
+      while (j >= 0 && c[j] > k) { c[j + 1] = c[j]; j--; }
+      c[j + 1] = k;
+    }
+    return c[2];
+  }
+
+  void _seedFilter(int16_t x, int16_t y) {
+    for (uint8_t i = 0; i < 5; i++) { _hx[i] = x; _hy[i] = y; }
+    _histIdx = 0;
+    _filtX = x;
+    _filtY = y;
+  }
+
+  // 5-sample median filter on X and Y axes + symmetric low-pass IIR
+  void _pushAndFilter(int16_t x, int16_t y, int16_t &medX, int16_t &medY) {
+    _hx[_histIdx] = x;
+    _hy[_histIdx] = y;
+    if (++_histIdx >= 5) _histIdx = 0;
+    medX = _median5(_hx);
+    medY = _median5(_hy);
+    _filtX = (int16_t)(((int32_t)_filtX + (int32_t)medX) / 2);
+    _filtY = (int16_t)(((int32_t)_filtY + (int32_t)medY) / 2);
+  }
+
+  void _trackEnvelope(int16_t x, int16_t y) {
+    if (x < _minX) _minX = x;
+    if (x > _maxX) _maxX = x;
+    if (y < _minY) _minY = y;
+    if (y > _maxY) _maxY = y;
+  }
+
+  bool _computeEnvelopeCenter(int16_t &ox, int16_t &oy) const {
+    if (_maxX <= _minX || _maxY <= _minY) return false;
+    if ((_maxX - _minX) < IMU_MIN_SPAN_LSB || (_maxY - _minY) < IMU_MIN_SPAN_LSB) return false;
+    ox = (int16_t)(((int32_t)_minX + (int32_t)_maxX) / 2);
+    oy = (int16_t)(((int32_t)_minY + (int32_t)_maxY) / 2);
+    return true;
+  }
 
   static bool _write(uint8_t reg, uint8_t val) {
     Wire.beginTransmission(MAG_ADDR);
@@ -267,18 +343,78 @@ class ImuSensor {
     return true;
   }
 
-  static int16_t _calcHeading(int16_t x, int16_t y) {
-    float rad = atan2((float)y, (float)x);
+  int16_t _calcHeading(int16_t x, int16_t y) const {
+    int16_t cx = x - _offX;
+    int16_t cy = y - _offY;
+    if (cx == 0 && cy == 0) return _yawDdeg;
+    float rad = atan2((float)cy, (float)cx);
     int16_t ddeg = (int16_t)(rad * (1800.0f / 3.14159265f));
     if (ddeg < 0) ddeg += 3600;
     return ddeg;
   }
 
 public:
-  void init() {
+  void loadOffsetsFromEeprom() {
+    ImuCalBlob blob;
+    EEPROM.get(IMU_EEPROM_ADDR, blob);
+    if (blob.magic != IMU_EEPROM_MAGIC) { _offX = 0; _offY = 0; _hasEepromCal = false; return; }
+    uint16_t expectedCrc = calcCrc16((const uint8_t*)&blob, sizeof(ImuCalBlob) - sizeof(uint16_t));
+    if (blob.crc != expectedCrc || blob.offX < -2048 || blob.offX > 2048 || blob.offY < -2048 || blob.offY > 2048) {
+      _offX = 0; _offY = 0; _hasEepromCal = false; return;
+    }
+    _offX = blob.offX;
+    _offY = blob.offY;
+    _hasEepromCal = (_offX != 0 || _offY != 0);
+  }
+
+  void saveOffsetsToEeprom(int16_t ox, int16_t oy) {
+    _offX = ox;
+    _offY = oy;
+    _hasEepromCal = (ox != 0 || oy != 0);
+    ImuCalBlob blob;
+    blob.magic = IMU_EEPROM_MAGIC;
+    blob.offX  = _offX;
+    blob.offY  = _offY;
+    blob.crc   = calcCrc16((const uint8_t*)&blob, sizeof(ImuCalBlob) - sizeof(uint16_t));
+    EEPROM.put(IMU_EEPROM_ADDR, blob);
+  }
+
+  void resetEnvelope() {
+    _minX = 32767; _maxX = -32767;
+    _minY = 32767; _maxY = -32767;
+  }
+
+  void commitDynamicOffsets() {
+    if (_hasEepromCal) return;
+    int16_t ox = 0, oy = 0;
+    if (_computeEnvelopeCenter(ox, oy)) {
+      _offX = ox;
+      _offY = oy;
+      _yawDdeg = _calcHeading(_filtX, _filtY);
+      _lastCompassYaw = _yawDdeg;
+    }
+  }
+
+  bool finishCalibration(int16_t &ox, int16_t &oy) {
+    if (!_computeEnvelopeCenter(ox, oy)) return false;
+    saveOffsetsToEeprom(ox, oy);
+    _yawDdeg = _calcHeading(_filtX, _filtY);
+    _lastCompassYaw = _yawDdeg;
+    return true;
+  }
+
+  void init(bool reloadEeprom = false) {
+    if (reloadEeprom) loadOffsetsFromEeprom();
     _ok = false;
     _fails = 0;
     _turnDdeg = 0;
+    _rawTurnDdeg = 0;
+    _prevTurned1 = 0;
+    _prevTurned2 = 0;
+    _settleSamples = 0;
+    _glitchCnt = 0;
+    _settling = false;
+    resetEnvelope();
 
     // CRA_REG_M (0x00): 75 Hz data rate (0x18)
     if (!_write(0x00, 0x18)) return;
@@ -291,15 +427,16 @@ public:
     int16_t x, y;
     if (_readMag(x, y)) {
       _ok = true;
+      _rawX = x;  _rawY = y;
+      _seedFilter(x, y);
       int16_t h = _calcHeading(x, y);
       _yawDdeg = h;
       _lastCompassYaw = h;
-      _turnDdeg = 0;
     }
     _lastMs = millis();
   }
 
-  void update() {
+  void update(bool moving = false, bool gyroActive = false) {
     uint32_t now = millis();
     if (!_ok || (now - _lastMs < 13)) return; // 75 Hz ODR (~13.3 ms); do not touch I2C if sensor unavailable
     _lastMs = now;
@@ -310,30 +447,115 @@ public:
       return;
     }
     _fails = 0;
+    _rawX = x;
+    _rawY = y;
 
-    int16_t curYaw = _calcHeading(x, y);
+    // During initial 65 ms motor inrush settling window, fill 5-sample median FIFO purely with powered samples
+    if (_settling) {
+      if (_settleSamples == 0) {
+        _seedFilter(x, y);
+      } else {
+        int16_t mx, my;
+        _pushAndFilter(x, y, mx, my);
+      }
+      _settleSamples++;
+      int16_t curYaw = _calcHeading(_filtX, _filtY);
+      _yawDdeg = curYaw;
+      _lastCompassYaw = curYaw;
+      _turnDdeg = 0;
+      _rawTurnDdeg = 0;
+      _prevTurned1 = 0;
+      _prevTurned2 = 0;
+      _glitchCnt = 0;
+      if ((now - _settleStartMs) >= TURN_SETTLE_MS && _settleSamples >= 5) {
+        _settling = false;
+      }
+      return;
+    }
+
+    int16_t medX, medY;
+    _pushAndFilter(x, y, medX, medY);
+    if (moving) _trackEnvelope(medX, medY);
+
+    int16_t curYaw = _calcHeading(_filtX, _filtY);
     int16_t diff = curYaw - _lastCompassYaw;
     if (diff > 1800)       diff -= 3600;
     else if (diff < -1800) diff += 3600;
 
+    // Outlier gate: ignore transient 1..3 sample spikes instead of lagging _lastCompassYaw
+    if (diff > IMU_GLITCH_DDEG || diff < -IMU_GLITCH_DDEG) {
+      if (++_glitchCnt > 3) {
+        _lastCompassYaw = curYaw;
+        _yawDdeg = curYaw;
+        _glitchCnt = 0;
+      }
+      return;
+    }
+    _glitchCnt = 0;
     _lastCompassYaw = curYaw;
     _yawDdeg = curYaw;
+
+    _prevTurned2 = _prevTurned1;
+    _prevTurned1 = turnedAbsDdeg();
+    _rawTurnDdeg += diff;
     _turnDdeg += diff;
+
+    if (gyroActive) {
+      int8_t expSign = (_rightSign != 0) ? (_turnIsRight ? _rightSign : (int8_t)(-_rightSign)) : 0;
+      if (expSign == 0) {
+        if (_turnDdeg >= 120 || _turnDdeg <= -120) {
+          int8_t obsSign = (_turnDdeg > 0) ? 1 : -1;
+          _rightSign = _turnIsRight ? obsSign : (int8_t)(-obsSign);
+        }
+      } else if ((expSign > 0 && _turnDdeg < 0) || (expSign < 0 && _turnDdeg > 0)) {
+        // Clamp reverse-direction excursion to 0 so initial magnetic bounce never builds negative debt or false stop
+        _turnDdeg = 0;
+        // Self-heal polarity if physical rotation moved > 25 deg consistently in the opposite sign
+        if ((expSign > 0 && _rawTurnDdeg < -250) || (expSign < 0 && _rawTurnDdeg > 250)) {
+          _rightSign = (int8_t)(-_rightSign);
+          _turnDdeg = _rawTurnDdeg;
+        }
+      }
+    }
   }
 
-  void resetTurn() {
-    _turnDdeg = 0;
+  void resetTurn(bool isRight = true) {
+    _turnIsRight    = isRight;
+    _turnDdeg       = 0;
+    _rawTurnDdeg    = 0;
+    _prevTurned1    = 0;
+    _prevTurned2    = 0;
+    _settleSamples  = 0;
+    _glitchCnt      = 0;
+    _lastCompassYaw = _yawDdeg;
+    _settleStartMs  = millis();
+    _settling       = true;
+  }
+
+  bool pollDiagnostic() {
+    if (!_ok) init(false);
     int16_t x, y;
     if (_ok && _readMag(x, y)) {
+      _rawX = x;
+      _rawY = y;
       _yawDdeg = _calcHeading(x, y);
-      _lastMs = millis();
+      return true;
     }
-    _lastCompassYaw = _yawDdeg;
+    return false;
   }
 
   bool ok() const { return _ok; }
+  bool settling() const { return _settling; }
   int32_t yawDdeg() const { return _yawDdeg; }
+  int32_t turnDdeg() const { return _turnDdeg; }
   int16_t turnedAbsDdeg() const { return (int16_t)(_turnDdeg < 0 ? -_turnDdeg : _turnDdeg); }
+  bool confirmedTurn(int16_t tgtDdeg) const {
+    return !_settling && turnedAbsDdeg() >= tgtDdeg && _prevTurned1 >= tgtDdeg && _prevTurned2 >= tgtDdeg;
+  }
+  int16_t rawX() const { return _rawX; }
+  int16_t rawY() const { return _rawY; }
+  int16_t offX() const { return _offX; }
+  int16_t offY() const { return _offY; }
 };
 
 // ── Class 3: Direct I2C PCA9685 Driver + 4-Wheel Equalized Actuators ─────────
@@ -500,7 +722,10 @@ public:
     for (uint8_t i = 0; i < NUM_WHEELS; i++) {
       if (!isWheelCalValid(blob.wheels[i])) return false;
     }
-    for (uint8_t i = 0; i < NUM_WHEELS; i++) _w[i] = blob.wheels[i];
+    for (uint8_t i = 0; i < NUM_WHEELS; i++) {
+      _w[i] = blob.wheels[i];
+      _w[i].inverted = DEFAULT_WHEEL_CAL[i].inverted; // Enforce hardware mounting polarity
+    }
     _stopDetach   = (blob.stopDetach != 0);
     _oscHz        = blob.oscHz;
     _prescale     = _calcPrescale(_oscHz);
@@ -684,7 +909,7 @@ static ImuSensor        imu;
 static Actuators        act;
 
 static Mode     mode = M_IDLE;
-static uint32_t tImu = 0, tUs = 0, tState = 0, tFallback = 0;
+static uint32_t tImu = 0, tUs = 0, tState = 0, tFallback = 0, tMaxTurn = 6000UL;
 static int16_t  tgtTurnDdeg = 0;
 static bool     turnRight = true, toggleUs = false, obsLatched = false, rxOvf = false;
 static char     rxBuf[48];
@@ -695,6 +920,20 @@ static uint16_t minUsMm() { uint16_t a = us1.medianMm(), b = us2.medianMm(); ret
 static void startAutoRev(uint16_t mm, bool blockedCmd) {
   obsLatched = true; act.setWheels(-50, -50); mode = M_REV; tState = millis();
   Serial.print(blockedCmd ? F("[ACK] BLK|") : F("[EVENT] OBS|")); Serial.println(mm);
+}
+
+static void startGyroTurn(bool isRight, int16_t absDdeg) {
+  if (!imu.ok()) imu.init(false); // Re-attempt I2C init once per turn command if previously offline
+  turnRight   = isRight;
+  tgtTurnDdeg = absDdeg;
+  // Proportional fallback (~2200 ms per 90 deg at 50% speed) and proportional max safety timeout
+  tFallback   = constrain(((uint32_t)tgtTurnDdeg * 220UL) / 90UL, 150UL, 15000UL);
+  tMaxTurn    = constrain(tFallback + 3000UL, 6000UL, 18000UL);
+  act.setWheels(turnRight ? TURN_MAX_SPD : -TURN_MAX_SPD, turnRight ? -TURN_MAX_SPD : TURN_MAX_SPD);
+  imu.resetTurn(turnRight); // Settle & sample reference heading AFTER energizing wheel servos
+  tState = millis();
+  mode   = M_GYRO;
+  Serial.print(F("[ACK] G|")); Serial.print(turnRight ? 'R' : 'L'); Serial.print('|'); Serial.println(tgtTurnDdeg);
 }
 
 static uint8_t parseInts(const char* s, int16_t* out, uint8_t maxCount) {
@@ -844,13 +1083,7 @@ static void handleOpcode(const char* cmd) {
     while (*p == ' ') p++;
     int16_t deg = 0;
     if (parseInts(p, &deg, 1) == 1 && deg > 0 && deg <= 360) {
-      turnRight = isR;
-      tgtTurnDdeg = deg * 10;
-      tFallback = constrain((uint32_t)tgtTurnDdeg * 100UL / 90UL, 100UL, 6000UL);
-      tState = millis(); imu.resetTurn();
-      act.setWheels(turnRight ? TURN_MAX_SPD : -TURN_MAX_SPD, turnRight ? -TURN_MAX_SPD : TURN_MAX_SPD);
-      mode = M_GYRO;
-      Serial.print(F("[ACK] G|")); Serial.print(turnRight ? 'R' : 'L'); Serial.print('|'); Serial.println(tgtTurnDdeg);
+      startGyroTurn(isR, (int16_t)(deg * 10));
       return;
     } else {
       Serial.println(F("[ERROR] GIROD/GIROI <1-360>"));
@@ -901,13 +1134,7 @@ static void handleOpcode(const char* cmd) {
     case 'G': {
       int16_t ddeg;
       if (parseInts(arg, &ddeg, 1) == 1 && ddeg != 0 && ddeg >= -3600 && ddeg <= 3600) {
-        turnRight = (ddeg > 0);
-        tgtTurnDdeg = (int16_t)abs(ddeg);
-        tFallback = constrain((uint32_t)tgtTurnDdeg * 100UL / 90UL, 100UL, 6000UL);
-        tState = millis(); imu.resetTurn();
-        act.setWheels(turnRight ? TURN_MAX_SPD : -TURN_MAX_SPD, turnRight ? -TURN_MAX_SPD : TURN_MAX_SPD);
-        mode = M_GYRO;
-        Serial.print(F("[ACK] G|")); Serial.print(turnRight ? 'R' : 'L'); Serial.print('|'); Serial.println(tgtTurnDdeg);
+        startGyroTurn(ddeg > 0, (int16_t)abs(ddeg));
       } else Serial.println(F("[ERROR] G <ddeg>"));
       break;
     }
@@ -997,6 +1224,50 @@ static void handleOpcode(const char* cmd) {
       } else Serial.println(F("[ERROR] E [0]"));
       break;
     }
+    case 'I': { // I = query IMU; I <ox> <oy> = set offsets; I C = auto-cal 360; I 0 = reset offsets
+      while (*arg == ' ') arg++;
+      if (*arg == '\0') {
+        imu.pollDiagnostic();
+        Serial.print(F("[IMU] ok="));  Serial.print(imu.ok() ? 1 : 0);
+        Serial.print(F(",raw=("));     Serial.print(imu.rawX()); Serial.print(','); Serial.print(imu.rawY());
+        Serial.print(F("),cal=("));    Serial.print(imu.rawX() - imu.offX()); Serial.print(','); Serial.print(imu.rawY() - imu.offY());
+        Serial.print(F("),off=("));    Serial.print(imu.offX()); Serial.print(','); Serial.print(imu.offY());
+        Serial.print(F("),yaw="));     Serial.print(imu.yawDdeg());
+        Serial.print(F(",turn="));     Serial.println(imu.turnDdeg());
+      } else if ((arg[0] == 'C' || arg[0] == 'c') && arg[1] == '\0') {
+        if (!imu.ok()) imu.init(false);
+        if (!imu.ok()) { Serial.println(F("[ERROR] IMU")); break; }
+        imu.resetEnvelope();
+        act.setWheels(TURN_MAX_SPD, -TURN_MAX_SPD);
+        imu.resetTurn(true);
+        uint32_t t0 = millis();
+        while ((uint32_t)(millis() - t0) < 2800UL) {
+          act.updateArm(millis());
+          imu.update(true, false);
+          delay(2);
+        }
+        act.setWheels(0, 0);
+        mode = M_IDLE;
+        int16_t ox = 0, oy = 0;
+        if (imu.finishCalibration(ox, oy)) {
+          Serial.print(F("[ACK] I|CAL|")); Serial.print(ox); Serial.print('|'); Serial.println(oy);
+        } else {
+          Serial.println(F("[ERROR] I|CAL"));
+        }
+      } else {
+        int16_t v[2];
+        uint8_t n = parseInts(arg, v, 2);
+        if (n == 1 && v[0] == 0) {
+          imu.saveOffsetsToEeprom(0, 0);
+          imu.resetEnvelope();
+          Serial.println(F("[ACK] I|0|0"));
+        } else if (n == 2 && v[0] >= -2048 && v[0] <= 2048 && v[1] >= -2048 && v[1] <= 2048) {
+          imu.saveOffsetsToEeprom(v[0], v[1]);
+          Serial.print(F("[ACK] I|")); Serial.print(v[0]); Serial.print('|'); Serial.println(v[1]);
+        } else Serial.println(F("[ERROR] I [ox oy | C | 0]"));
+      }
+      break;
+    }
     case 'K': {
       Serial.print(F("[CAL] pca=")); Serial.print(act.pcaOk() ? 1 : 0);
       Serial.print(F(",eep="));      Serial.print(act.eepromLoaded() ? 1 : 0);
@@ -1031,7 +1302,7 @@ static void handleOpcode(const char* cmd) {
 
 void setup() {
   Serial.begin(115200);
-  act.init(); us1.init(); us2.init(); imu.init();
+  act.init(); us1.init(); us2.init(); imu.init(true);
   for (uint8_t i = 0; i < 5; i++) {
     us1.trigger(); while (us1.busy()) us1.poll(); delay(4);
     us2.trigger(); while (us2.busy()) us2.poll(); delay(4);
@@ -1045,17 +1316,21 @@ void loop() {
   uint32_t now = millis();
   act.updateArm(now);
 
-  if (now - tImu >= 2) { tImu = now; imu.update(); }
+  if (now - tImu >= 2) { tImu = now; imu.update(act.left() != 0 || act.right() != 0, mode == M_GYRO); }
 
   if (mode == M_GYRO) {
     int16_t turned = imu.turnedAbsDdeg();
-    bool done = imu.ok() ? (turned >= tgtTurnDdeg) : (now - tState >= tFallback);
-    if (done || (now - tState >= 6000UL)) {
-      act.setWheels(0, 0); mode = M_IDLE;
+    bool done = imu.ok() ? imu.confirmedTurn(tgtTurnDdeg) : (now - tState >= tFallback);
+    if (done || (now - tState >= tMaxTurn)) {
+      act.setWheels(0, 0);
+      imu.commitDynamicOffsets();
+      mode = M_IDLE;
       Serial.print(F("[EVENT] TD|")); Serial.print(turnRight ? 'R' : 'L'); Serial.print('|');
       Serial.println(imu.ok() ? turned : tgtTurnDdeg);
-    } else if (imu.ok() && (tgtTurnDdeg - turned < 60)) {
-      int16_t spd = TURN_MIN_SPD + ((int16_t)(TURN_MAX_SPD - TURN_MIN_SPD) * (tgtTurnDdeg - turned)) / 60;
+    } else if (imu.ok() && !imu.settling() && (tgtTurnDdeg - turned < TURN_SLOW_DDEG)) {
+      int16_t rem = tgtTurnDdeg - turned;
+      if (rem < 0) rem = 0;
+      int16_t spd = TURN_MIN_SPD + (int16_t)(((int32_t)(TURN_MAX_SPD - TURN_MIN_SPD) * rem) / TURN_SLOW_DDEG);
       act.setWheels(turnRight ? spd : -spd, turnRight ? -spd : spd);
     }
   }
