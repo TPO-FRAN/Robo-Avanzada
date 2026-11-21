@@ -7,7 +7,7 @@
         * L298N Mini Left  - FL (0): IN1=GPIO 25 (ch 0), IN2=GPIO 26 (ch 1)
         * L298N Mini Left  - RL (1): IN3=GPIO 27 (ch 2), IN4=GPIO 14 (ch 3)
         * L298N Mini Right - FR (2): IN1=GPIO 32 (ch 4), IN2=GPIO 33 (ch 5) [inverted=1]
-        * L298N Mini Right - RR (3): IN3=GPIO 16 (ch 6), IN4=GPIO 17 (ch 7) [inverted=1]
+        * L298N Mini Right - RR (3): IN3=GPIO 19 (ch 6), IN4=GPIO 18 (ch 7) [inverted=1]
     - 2-DOF Robotic Arm (2x Standard MG996R Servos directly on ESP32 LEDC @ 50 Hz, 14-bit):
         * Arm Base  : GPIO 23 (LEDC ch 8, LS timer group)
         * Arm Elbow : GPIO 13 (LEDC ch 9, LS timer group)
@@ -15,8 +15,8 @@
     - GY-511 (LSM303DLHC 2D Magnetometer @ 0x1E) on dedicated Hardware I2C (400 kHz):
         * SDA = GPIO 21, SCL = GPIO 22, VCC = 3.3V, GND = GND
     - 2x HC-SR04 Ultrasonic Sensors (IRAM_ATTR GPIO interrupts, N=5 median FIFO):
-        * US1 : TRIG1 = GPIO 18, ECHO1 = GPIO 34 (input-only; requires 5V->3.3V divider)
-        * US2 : TRIG2 = GPIO 19, ECHO2 = GPIO 35 (input-only; requires 5V->3.3V divider)
+        * US1 : TRIG1 = GPIO 4,  ECHO1 = GPIO 34 (input-only; requires 5V->3.3V divider)
+        * US2 : TRIG2 = GPIO 2,  ECHO2 = GPIO 35 (input-only; requires 5V->3.3V divider)
 
   UART & Serial Commands (115200 baud, Spanish or Compact Opcodes):
     - ADELANTE [vel]        / W <l> <r>   : Forward / differential speed (-100..100 %)
@@ -35,6 +35,7 @@
     - M <fl> <rl> <fr> <rr> : Set maxDutyPct (20..100) for all 4 wheels (straight-line trim)
     - M <0-3> <min> <max>   : Set minDutyPct (0..80) and maxDutyPct (20..100) for wheel 0..3
     - B <0|1>               : Active short-brake on stop (1=enabled 80ms pulse, 0=coast)
+    - H [0|1 | T <deg> | <kp> <ki> <kd> | S | R] : Straight-line IMU Heading-Hold config/status
     - I [ox oy | C | P <+1|-1> | 0] : Query IMU, set offsets, 360 auto-cal (I C), CW polarity, reset
     - E [0]                 : Save motor calibration to NVS (E 0 = restore defaults)
     - K                     : Print active motor & NVS calibration
@@ -56,7 +57,7 @@
 constexpr uint8_t PIN_FL_A   = 25, PIN_FL_B = 26; // L298N Mini Left  - FL (ch 0, 1)
 constexpr uint8_t PIN_RL_A   = 27, PIN_RL_B = 14; // L298N Mini Left  - RL (ch 2, 3)
 constexpr uint8_t PIN_FR_A   = 32, PIN_FR_B = 33; // L298N Mini Right - FR (ch 4, 5)
-constexpr uint8_t PIN_RR_A   = 16, PIN_RR_B = 17; // L298N Mini Right - RR (ch 6, 7)
+constexpr uint8_t PIN_RR_A   = 19, PIN_RR_B = 18; // L298N Mini Right - RR (ch 6, 7)
 
 constexpr uint8_t PIN_ARM_B  = 23; // Direct ESP32 LEDC ch 8 (Arm Base, 50 Hz)
 constexpr uint8_t PIN_ARM_E  = 13; // Direct ESP32 LEDC ch 9 (Arm Elbow, 50 Hz)
@@ -64,8 +65,8 @@ constexpr uint8_t PIN_ARM_E  = 13; // Direct ESP32 LEDC ch 9 (Arm Elbow, 50 Hz)
 constexpr uint8_t PIN_I2C_SDA = 21;
 constexpr uint8_t PIN_I2C_SCL = 22;
 
-constexpr uint8_t PIN_TRIG1  = 18, PIN_ECHO1 = 34; // Input-only; requires 5V->3.3V divider
-constexpr uint8_t PIN_TRIG2  = 19, PIN_ECHO2 = 35; // Input-only; requires 5V->3.3V divider
+constexpr uint8_t PIN_TRIG1  = 4, PIN_ECHO1 = 34; // Input-only; requires 5V->3.3V divider
+constexpr uint8_t PIN_TRIG2  = 2, PIN_ECHO2 = 35; // Input-only; requires 5V->3.3V divider
 
 // ── LEDC PWM & Motion Constants ──────────────────────────────────────────────
 constexpr uint32_t MOTOR_PWM_HZ      = 2000UL;
@@ -93,6 +94,19 @@ constexpr uint8_t  TURN_CAL_SPD      = 60;
 constexpr int16_t  TURN_SLOW_DDEG    = 250;  // Linear ramp in last 25.0 deg
 constexpr uint32_t BRAKE_PULSE_MS    = 80UL; // Active L298N short-brake duration before coast
 constexpr int8_t   ZONA_MUERTA       = 5;    // |pct| below this stops wheel
+
+// ── Corrección de Rumbo en Línea Recta (IMU Heading-Hold) ────────────────────
+// Cambia HDG_TOLERANCIA_DEG para ajustar fácilmente el umbral de desviación (°)
+// antes de aplicar corrección diferencial (también ajustable en vivo con `H T <deg>`).
+constexpr bool     HDG_DEFAULT_ENABLED = true;   // true = corrección activa al encender
+constexpr float    HDG_TOLERANCIA_DEG  = 1.5f;   // Tolerancia / umbral de corrección en grados (0.0..15.0)
+constexpr uint32_t HDG_LOCK_DELAY_MS   = 100UL;  // Espera inicial (ms) para asentamiento de corriente DC
+constexpr float    HDG_KP              = 1.6f;   // Ganancia proporcional (% diferencial por grado)
+constexpr float    HDG_KI              = 0.40f;  // Ganancia integral (%/(deg*s), compensa asimetría fija)
+constexpr float    HDG_KD              = 0.12f;  // Ganancia derivativa filtrada (amortigua sobrepaso)
+constexpr float    HDG_I_MAX           = 18.0f;  // Límite anti-windup del término integral (%)
+constexpr float    HDG_U_MAX           = 35.0f;  // Corrección diferencial máxima |Der - Izq| (%)
+constexpr float    HDG_MAX_ERR_DEG     = 60.0f;  // Tope de error angular procesado por seguridad (°)
 
 // ── Core 2.x / 3.x LEDC Compatibility Helpers ────────────────────────────────
 static inline void pwmAttach(uint8_t pin, uint32_t freq, uint8_t bits, uint8_t ch) {
@@ -291,6 +305,7 @@ class ImuSensor {
   float    _calSignedArea = 0.0f;
   uint32_t _lastSampleUs = 0;
   uint32_t _calStartMs   = 0;
+  uint32_t _sampleSeq    = 0;
 
   static int16_t _median3(int16_t a, int16_t b, int16_t c) {
     if (a > b) { int16_t t = a; a = b; b = t; }
@@ -524,6 +539,7 @@ public:
     else if (diff < -180.0f) diff += 360.0f;
     _yawDeg   = curYaw;
     _turnDeg += diff;
+    _sampleSeq++;
   }
 
   void resetTurn(bool isRight = true) {
@@ -618,6 +634,237 @@ public:
   int16_t offY() const { return (int16_t)lroundf(_offY); }
   float scaleX() const { return _scaleX; }
   float scaleY() const { return _scaleY; }
+  float yawDeg() const { return _yawDeg; }
+  uint32_t sampleSeq() const { return _sampleSeq; }
+};
+
+// ── Class 2B: Straight-Line IMU Heading-Hold (PID + Headroom-Preserving Mixer) ─
+struct NvsHdgBlob {
+  uint16_t magic;
+  uint8_t  version;
+  uint8_t  enabled;
+  float    tolDeg;
+  float    kp;
+  float    ki;
+  float    kd;
+};
+
+constexpr uint16_t NVS_HDG_MAGIC = 0x4844U;
+constexpr uint8_t  NVS_HDG_VER   = 1U;
+
+class HeadingHold {
+  bool     _enabled      = HDG_DEFAULT_ENABLED;
+  bool     _active       = false;
+  bool     _locked       = false;
+  bool     _nvsLoaded    = false;
+  int8_t   _baseSpd      = 0;
+  float    _tolDeg       = HDG_TOLERANCIA_DEG;
+  float    _kp           = HDG_KP;
+  float    _ki           = HDG_KI;
+  float    _kd           = HDG_KD;
+  float    _targetYawDeg = 0.0f;
+  float    _lastErrDeg   = 0.0f;
+  float    _integral     = 0.0f;
+  float    _prevErrEff   = 0.0f;
+  float    _dFilt        = 0.0f;
+  uint32_t _armMs        = 0;
+  uint32_t _lastSampleUs = 0;
+  uint32_t _lastSeq      = 0;
+
+public:
+  void loadDefaults() {
+    _enabled   = HDG_DEFAULT_ENABLED;
+    _tolDeg    = constrain(HDG_TOLERANCIA_DEG, 0.0f, 15.0f);
+    _kp        = HDG_KP;
+    _ki        = HDG_KI;
+    _kd        = HDG_KD;
+    _nvsLoaded = false;
+  }
+
+  bool loadFromNvs() {
+    loadDefaults();
+    Preferences prefs;
+    if (!prefs.begin("hdg", true)) return false;
+    NvsHdgBlob blob{};
+    size_t len = prefs.getBytes("cfg", &blob, sizeof(blob));
+    prefs.end();
+    if (len != sizeof(blob) || blob.magic != NVS_HDG_MAGIC || blob.version != NVS_HDG_VER ||
+        blob.enabled > 1 ||
+        !isfinite(blob.tolDeg) || blob.tolDeg < 0.0f || blob.tolDeg > 15.0f ||
+        !isfinite(blob.kp) || blob.kp < 0.0f || blob.kp > 20.0f ||
+        !isfinite(blob.ki) || blob.ki < 0.0f || blob.ki > 10.0f ||
+        !isfinite(blob.kd) || blob.kd < 0.0f || blob.kd > 5.0f) {
+      return false;
+    }
+    _enabled   = (blob.enabled != 0);
+    _tolDeg    = blob.tolDeg;
+    _kp        = blob.kp;
+    _ki        = blob.ki;
+    _kd        = blob.kd;
+    _nvsLoaded = true;
+    return true;
+  }
+
+  void saveToNvs() const {
+    NvsHdgBlob blob{};
+    blob.magic   = NVS_HDG_MAGIC;
+    blob.version = NVS_HDG_VER;
+    blob.enabled = _enabled ? 1U : 0U;
+    blob.tolDeg  = _tolDeg;
+    blob.kp      = _kp;
+    blob.ki      = _ki;
+    blob.kd      = _kd;
+    Preferences prefs;
+    if (prefs.begin("hdg", false)) {
+      prefs.putBytes("cfg", &blob, sizeof(blob));
+      prefs.end();
+    }
+  }
+
+  void invalidateNvs() {
+    Preferences prefs;
+    if (prefs.begin("hdg", false)) {
+      prefs.remove("cfg");
+      prefs.end();
+    }
+    loadDefaults();
+  }
+
+  void init() { loadFromNvs(); }
+
+  void disarm() {
+    _active     = false;
+    _locked     = false;
+    _baseSpd    = 0;
+    _lastErrDeg = 0.0f;
+    _integral   = 0.0f;
+    _prevErrEff = 0.0f;
+    _dFilt      = 0.0f;
+  }
+
+  void arm(int8_t baseSpd, uint32_t nowMs, const ImuSensor &imuRef) {
+    if (!_enabled || !imuRef.ok() || (baseSpd > -ZONA_MUERTA && baseSpd < ZONA_MUERTA)) {
+      disarm();
+      return;
+    }
+    // Preserve locked target yaw & integral trim on same-direction speed adjustments
+    if (_active && _locked && ((baseSpd > 0) == (_baseSpd > 0))) {
+      _baseSpd = baseSpd;
+      return;
+    }
+    _active     = true;
+    _locked     = false;
+    _baseSpd    = baseSpd;
+    _lastErrDeg = 0.0f;
+    _integral   = 0.0f;
+    _prevErrEff = 0.0f;
+    _dFilt      = 0.0f;
+    _armMs      = nowMs;
+    _lastSeq    = imuRef.sampleSeq();
+  }
+
+  void setEnabled(bool en) {
+    _enabled = en;
+    if (!en) disarm();
+  }
+
+  void setTolerance(float deg) {
+    _tolDeg = constrain(deg, 0.0f, 15.0f);
+  }
+
+  void setGains(float kp, float ki, float kd) {
+    _kp       = constrain(kp, 0.0f, 20.0f);
+    _ki       = constrain(ki, 0.0f, 10.0f);
+    _kd       = constrain(kd, 0.0f, 5.0f);
+    _integral = 0.0f;
+    _dFilt    = 0.0f;
+  }
+
+  bool update(uint32_t nowMs, const ImuSensor &imuRef, int16_t &outL, int16_t &outR) {
+    if (!_active || !_enabled || !imuRef.ok()) return false;
+    uint32_t seq = imuRef.sampleSeq();
+    if (seq == _lastSeq) return false;
+    _lastSeq = seq;
+
+    if (!_locked) {
+      if ((nowMs - _armMs) < HDG_LOCK_DELAY_MS) return false;
+      _targetYawDeg = imuRef.yawDeg();
+      _locked       = true;
+      _lastErrDeg   = 0.0f;
+      _integral     = 0.0f;
+      _prevErrEff   = 0.0f;
+      _dFilt        = 0.0f;
+      _lastSampleUs = (uint32_t)micros();
+      return false;
+    }
+
+    uint32_t nowUs = (uint32_t)micros();
+    float dt = constrain((float)(nowUs - _lastSampleUs) * 1e-6f, 0.005f, 0.1f);
+    _lastSampleUs = nowUs;
+
+    float rawDiff = imuRef.yawDeg() - _targetYawDeg;
+    if (rawDiff > 180.0f)       rawDiff -= 360.0f;
+    else if (rawDiff < -180.0f) rawDiff += 360.0f;
+
+    float errRight = constrain(rawDiff * (float)imuRef.cwSign(), -HDG_MAX_ERR_DEG, HDG_MAX_ERR_DEG);
+    _lastErrDeg = errRight;
+
+    float errEff = 0.0f;
+    if (errRight > _tolDeg)       errEff = errRight - _tolDeg;
+    else if (errRight < -_tolDeg) errEff = errRight + _tolDeg;
+
+    float dRaw = (errEff - _prevErrEff) / dt;
+    _prevErrEff = errEff;
+    _dFilt += 0.25f * (dRaw - _dFilt);
+
+    float uUnsat = _kp * errEff + _integral + _kd * _dFilt;
+    bool satHi = (uUnsat >= HDG_U_MAX && errEff > 0.0f);
+    bool satLo = (uUnsat <= -HDG_U_MAX && errEff < 0.0f);
+    if (!satHi && !satLo) {
+      _integral = constrain(_integral + _ki * errEff * dt, -HDG_I_MAX, HDG_I_MAX);
+    }
+    float u = constrain(_kp * errEff + _integral + _kd * _dFilt, -HDG_U_MAX, HDG_U_MAX);
+
+    float halfU = 0.5f * u;
+    float lF = (float)_baseSpd - halfU;
+    float rF = (float)_baseSpd + halfU;
+
+    if (_baseSpd > 0) {
+      const float lo = (float)ZONA_MUERTA;
+      const float hi = 100.0f;
+      if (rF > hi)      { lF -= (rF - hi); rF = hi; }
+      else if (lF > hi) { rF -= (lF - hi); lF = hi; }
+      if (lF < lo)      { rF += (lo - lF); lF = lo; }
+      else if (rF < lo) { lF += (lo - rF); rF = lo; }
+      lF = constrain(lF, lo, hi);
+      rF = constrain(rF, lo, hi);
+    } else {
+      const float lo = -100.0f;
+      const float hi = -(float)ZONA_MUERTA;
+      if (lF < lo)      { rF += (lo - lF); lF = lo; }
+      else if (rF < lo) { lF += (lo - rF); rF = lo; }
+      if (rF > hi)      { lF -= (rF - hi); rF = hi; }
+      else if (lF > hi) { rF -= (lF - hi); lF = hi; }
+      lF = constrain(lF, lo, hi);
+      rF = constrain(rF, lo, hi);
+    }
+
+    outL = (int16_t)lroundf(lF);
+    outR = (int16_t)lroundf(rF);
+    return true;
+  }
+
+  bool enabled() const { return _enabled; }
+  bool active() const { return _active; }
+  bool locked() const { return _locked; }
+  bool nvsLoaded() const { return _nvsLoaded; }
+  int8_t baseSpd() const { return _baseSpd; }
+  float tolDeg() const { return _tolDeg; }
+  float targetYawDeg() const { return _targetYawDeg; }
+  float lastErrDeg() const { return _lastErrDeg; }
+  float kp() const { return _kp; }
+  float ki() const { return _ki; }
+  float kd() const { return _kd; }
 };
 
 // ── Class 3: 2x L298N Mini (8-GPIO LEDC) + Direct ESP32 LEDC 2-DOF Arm ───────
@@ -871,6 +1118,7 @@ enum Mode : uint8_t { M_IDLE = 0, M_DRIVE, M_GYRO, M_REV, M_CAL, M_CAL_IMU };
 static UltrasonicSensor us1(PIN_TRIG1, PIN_ECHO1, &g_ec1);
 static UltrasonicSensor us2(PIN_TRIG2, PIN_ECHO2, &g_ec2);
 static ImuSensor        imu;
+static HeadingHold      hdg;
 static Actuators        act;
 
 static Mode     mode        = M_IDLE;
@@ -887,6 +1135,7 @@ static uint16_t minUsMm() {
 
 static void startAutoRev(uint16_t mm, bool blockedCmd) {
   obsLatched = true;
+  hdg.disarm();
   act.setWheels(-50, -50);
   mode   = M_REV;
   tState = millis();
@@ -896,6 +1145,7 @@ static void startAutoRev(uint16_t mm, bool blockedCmd) {
 
 static void startGyroTurn(bool isRight, int16_t absDdeg) {
   if (!imu.ok()) imu.init(false);
+  hdg.disarm();
   turnRight   = isRight;
   tgtTurnDdeg = absDdeg;
   tFallback   = constrain(((uint32_t)tgtTurnDdeg * 220UL) / 90UL, 150UL, 15000UL);
@@ -908,6 +1158,22 @@ static void startGyroTurn(bool isRight, int16_t absDdeg) {
   Serial.print(turnRight ? 'R' : 'L');
   Serial.print('|');
   Serial.println(tgtTurnDdeg);
+}
+
+static uint8_t parseFloats(const char* s, float* out, uint8_t maxCount) {
+  uint8_t count = 0;
+  const char* p = s;
+  while (*p != '\0') {
+    while (*p == ' ') p++;
+    if (*p == '\0') break;
+    if (count >= maxCount) return 0;
+    char* endP = nullptr;
+    float v = strtof(p, &endP);
+    if (endP == p || !isfinite(v)) return 0;
+    out[count++] = v;
+    p = endP;
+  }
+  return count;
 }
 
 static uint8_t parseInts(const char* s, int16_t* out, uint8_t maxCount) {
@@ -970,6 +1236,8 @@ static void handleOpcode(const char* cmd) {
     }
     act.setWheels(spd, spd);
     mode = (act.left() == 0 && act.right() == 0) ? M_IDLE : M_DRIVE;
+    if (mode == M_DRIVE) hdg.arm(act.left(), millis(), imu);
+    else                 hdg.disarm();
     Serial.print(F("[ACK] W|")); Serial.print(spd); Serial.print('|'); Serial.println(spd);
     return;
   }
@@ -987,6 +1255,8 @@ static void handleOpcode(const char* cmd) {
     imu.abortCalibration();
     act.setWheels(-spd, -spd);
     mode = (act.left() == 0 && act.right() == 0) ? M_IDLE : M_DRIVE;
+    if (mode == M_DRIVE) hdg.arm(act.left(), millis(), imu);
+    else                 hdg.disarm();
     Serial.print(F("[ACK] W|-")); Serial.print(spd); Serial.print(F("|-")); Serial.println(spd);
     return;
   }
@@ -1002,6 +1272,7 @@ static void handleOpcode(const char* cmd) {
       spd = (int16_t)v;
     }
     imu.abortCalibration();
+    hdg.disarm();
     act.setWheels(spd, -spd);
     mode = (act.left() == 0 && act.right() == 0) ? M_IDLE : M_DRIVE;
     Serial.print(F("[ACK] W|")); Serial.print(spd); Serial.print(F("|-")); Serial.println(spd);
@@ -1019,6 +1290,7 @@ static void handleOpcode(const char* cmd) {
       spd = (int16_t)v;
     }
     imu.abortCalibration();
+    hdg.disarm();
     act.setWheels(-spd, spd);
     mode = (act.left() == 0 && act.right() == 0) ? M_IDLE : M_DRIVE;
     Serial.print(F("[ACK] W|-")); Serial.print(spd); Serial.print('|'); Serial.println(spd);
@@ -1048,6 +1320,7 @@ static void handleOpcode(const char* cmd) {
 
   if (strcasecmp(cmd, "ALTO") == 0) {
     imu.abortCalibration();
+    hdg.disarm();
     act.stopAll();
     mode = M_IDLE;
     Serial.println(F("[ACK] X"));
@@ -1082,6 +1355,7 @@ static void handleOpcode(const char* cmd) {
       while (*arg == ' ') arg++;
       if (*arg != '\0') { Serial.println(F("[ERROR] OP")); break; }
       imu.abortCalibration();
+      hdg.disarm();
       act.stopAll();
       mode = M_IDLE;
       Serial.println(F("[ACK] X"));
@@ -1113,6 +1387,8 @@ static void handleOpcode(const char* cmd) {
         }
         act.setWheels(l, r);
         mode = (act.left() == 0 && act.right() == 0) ? M_IDLE : M_DRIVE;
+        if (mode == M_DRIVE && act.left() == act.right()) hdg.arm(act.left(), millis(), imu);
+        else                                                hdg.disarm();
         Serial.print(F("[ACK] W|")); Serial.print(l); Serial.print('|'); Serial.println(r);
       } else Serial.println(F("[ERROR] W <l> <r>"));
       break;
@@ -1131,6 +1407,7 @@ static void handleOpcode(const char* cmd) {
       int16_t v[2];
       if (parseInts(arg, v, 2) == 2 && v[0] >= 0 && v[0] < NUM_WHEELS && v[1] >= -100 && v[1] <= 100) {
         imu.abortCalibration();
+        hdg.disarm();
         act.rawWheelPct((uint8_t)v[0], v[1]);
         mode = M_CAL;
         Serial.print(F("[ACK] P|")); Serial.print(v[0]); Serial.print('|'); Serial.println(v[1]);
@@ -1170,6 +1447,58 @@ static void handleOpcode(const char* cmd) {
       } else Serial.println(F("[ERROR] B <0|1>"));
       break;
     }
+    case 'H': { // H | H <0|1> | H T <deg> | H <kp> <ki> <kd> | H S | H R
+      while (*arg == ' ') arg++;
+      if (*arg == '\0') {
+        Serial.print(F("[HDG] en="));   Serial.print(hdg.enabled() ? 1 : 0);
+        Serial.print(F(",act="));      Serial.print(hdg.active() ? 1 : 0);
+        Serial.print(F(",lck="));      Serial.print(hdg.locked() ? 1 : 0);
+        Serial.print(F(",nvs="));      Serial.print(hdg.nvsLoaded() ? 1 : 0);
+        Serial.print(F(",tol="));      Serial.print(hdg.tolDeg(), 2);
+        Serial.print(F(",tgt="));      Serial.print(hdg.targetYawDeg(), 1);
+        Serial.print(F(",err="));      Serial.print(hdg.lastErrDeg(), 1);
+        Serial.print(F(",kp="));       Serial.print(hdg.kp(), 2);
+        Serial.print(F(",ki="));       Serial.print(hdg.ki(), 2);
+        Serial.print(F(",kd="));       Serial.println(hdg.kd(), 2);
+      } else if ((arg[0] == '0' || arg[0] == '1') && arg[1] == '\0') {
+        bool en = (arg[0] == '1');
+        int8_t base = hdg.baseSpd();
+        hdg.setEnabled(en);
+        if (!en && mode == M_DRIVE && base != 0) {
+          act.setWheels(base, base);
+        } else if (en && mode == M_DRIVE && act.left() == act.right() && act.left() != 0) {
+          hdg.arm(act.left(), millis(), imu);
+        }
+        Serial.print(F("[ACK] H|")); Serial.println(arg[0]);
+      } else if ((arg[0] == 'T' || arg[0] == 't') && (arg[1] == ' ' || arg[1] == '\0')) {
+        float tol = 0.0f;
+        if (parseFloats(arg + 1, &tol, 1) == 1 && tol >= 0.0f && tol <= 15.0f) {
+          hdg.setTolerance(tol);
+          Serial.print(F("[ACK] H|T|")); Serial.println(hdg.tolDeg(), 2);
+        } else Serial.println(F("[ERROR] H T <0.0-15.0>"));
+      } else if ((arg[0] == 'S' || arg[0] == 's') && arg[1] == '\0') {
+        hdg.saveToNvs();
+        Serial.println(F("[ACK] H|SAVED"));
+      } else if ((arg[0] == 'R' || arg[0] == 'r') && arg[1] == '\0') {
+        int8_t base = hdg.baseSpd();
+        hdg.invalidateNvs();
+        if (!hdg.enabled() && mode == M_DRIVE && base != 0) act.setWheels(base, base);
+        Serial.println(F("[ACK] H|DEFAULT"));
+      } else {
+        float v[3];
+        if (parseFloats(arg, v, 3) == 3 &&
+            v[0] >= 0.0f && v[0] <= 20.0f &&
+            v[1] >= 0.0f && v[1] <= 10.0f &&
+            v[2] >= 0.0f && v[2] <= 5.0f) {
+          hdg.setGains(v[0], v[1], v[2]);
+          Serial.print(F("[ACK] H|PID|"));
+          Serial.print(hdg.kp(), 2); Serial.print('|');
+          Serial.print(hdg.ki(), 2); Serial.print('|');
+          Serial.println(hdg.kd(), 2);
+        } else Serial.println(F("[ERROR] H [0|1 | T <deg> | <kp> <ki> <kd> | S | R]"));
+      }
+      break;
+    }
     case 'E': { // E = save motor cal to NVS; E 0 = restore defaults
       while (*arg == ' ') arg++;
       if (*arg == '\0') {
@@ -1196,6 +1525,7 @@ static void handleOpcode(const char* cmd) {
       } else if ((arg[0] == 'C' || arg[0] == 'c') && arg[1] == '\0') {
         if (!imu.ok()) imu.init(false);
         if (!imu.ok()) { Serial.println(F("[ERROR] IMU")); break; }
+        hdg.disarm();
         imu.beginCalibration();
         act.setWheels(TURN_CAL_SPD, -TURN_CAL_SPD);
         tState = millis();
@@ -1224,6 +1554,8 @@ static void handleOpcode(const char* cmd) {
       Serial.print(F("[CAL] nvs=")); Serial.print(act.nvsLoaded() ? 1 : 0);
       Serial.print(F(",brk="));      Serial.print(act.activeBrake() ? 1 : 0);
       Serial.print(F(",imuCal="));   Serial.print(imu.hasCal() ? 1 : 0);
+      Serial.print(F(",hdg="));      Serial.print(hdg.enabled() ? 1 : 0);
+      Serial.print(F(",tol="));      Serial.print(hdg.tolDeg(), 1);
       for (uint8_t i = 0; i < NUM_WHEELS; i++) {
         const MotorCal &m = act.motor(i);
         Serial.print(F(" | M"));   Serial.print(i);
@@ -1239,6 +1571,7 @@ static void handleOpcode(const char* cmd) {
       while (*arg == ' ') arg++;
       if (*arg == '\0' || strcasecmp(arg, "TOP") == 0) {
         imu.abortCalibration();
+        hdg.disarm();
         act.stopAll();
         mode = M_IDLE;
         Serial.println(F("[ACK] X"));
@@ -1260,6 +1593,7 @@ void setup() {
   us1.init();
   us2.init();
   imu.init(true);
+  hdg.init();
 
   // Pre-fill the 5-sample median FIFO of both HC-SR04 sensors
   for (uint8_t i = 0; i < 5; i++) {
@@ -1280,7 +1614,20 @@ void loop() {
   act.update(now);
   imu.update();
 
-  if (mode == M_GYRO) {
+  if (mode == M_DRIVE && hdg.active()) {
+    if (!imu.ok()) {
+      int8_t base = hdg.baseSpd();
+      hdg.disarm();
+      if (base != 0) act.setWheels(base, base);
+    } else {
+      int16_t corrL = 0, corrR = 0;
+      if (hdg.update(now, imu, corrL, corrR)) {
+        if (corrL != act.left() || corrR != act.right()) {
+          act.setWheels(corrL, corrR);
+        }
+      }
+    }
+  } else if (mode == M_GYRO) {
     int16_t turned = imu.progressDdeg();
     bool done = imu.ok() ? (turned >= tgtTurnDdeg) : ((now - tState) >= tFallback);
     if (done || ((now - tState) >= tMaxTurn)) {
